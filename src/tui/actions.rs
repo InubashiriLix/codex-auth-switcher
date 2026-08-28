@@ -320,7 +320,6 @@ pub fn poll_control_updates(ui: &mut Ui) {
                 if ui.checking.is_none() {
                     ui.index.accounts.clone_from(&snapshot.accounts);
                 }
-                let total_requests = snapshot.stats.total_requests;
                 let failures = snapshot.stats.failed_requests;
                 let ttfb = snapshot.stats.last_ttfb_ms.unwrap_or(0);
                 let proxy = ui
@@ -333,10 +332,13 @@ pub fn poll_control_updates(ui: &mut Ui) {
                 ui.snapshot = Some(snapshot);
                 ui.recent_events = events;
                 ui.recent_requests = requests;
-                ui.request_history = metrics
+                ui.clamp_event_selection();
+                ui.request_history = metrics_1m
                     .buckets
                     .iter()
-                    .map(|bucket| bucket.requests)
+                    .map(|bucket| {
+                        bucket.requests.saturating_mul(1000) / metrics_1m.bucket_seconds.max(1)
+                    })
                     .collect();
                 ui.failure_history = metrics
                     .buckets
@@ -346,7 +348,7 @@ pub fn poll_control_updates(ui: &mut Ui) {
                 ui.ttfb_history = metrics
                     .buckets
                     .iter()
-                    .map(|bucket| bucket.average_ttfb_ms.unwrap_or(0))
+                    .map(|bucket| bucket.ttfb_p95_ms.unwrap_or(0))
                     .collect();
                 ui.metrics = Some(metrics);
                 ui.metrics_1m = Some(metrics_1m);
@@ -357,7 +359,16 @@ pub fn poll_control_updates(ui: &mut Ui) {
                     }
                 }
                 if ui.request_history.is_empty() {
-                    ui.push_metric_sample(total_requests, failures, ttfb);
+                    let rps_milli = ui
+                        .metrics_1m
+                        .as_ref()
+                        .map_or(0, |window| (window.rps * 1000.0).round() as u64);
+                    let ttfb_p95 = ui
+                        .metrics
+                        .as_ref()
+                        .and_then(|window| window.ttfb_p95_ms)
+                        .unwrap_or(ttfb);
+                    ui.push_metric_sample(rps_milli, failures, ttfb_p95);
                 }
             }
             ControlUpdate::Disconnected => {

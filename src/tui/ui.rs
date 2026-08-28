@@ -167,7 +167,7 @@ impl Ui {
             instance_selected: 0,
             event_selected: 0,
             control_selected: 0,
-            onboarding_checked: !attached_daemon,
+            onboarding_checked: false,
             filter: String::new(),
             modal: Modal::None,
             detail: None,
@@ -195,6 +195,7 @@ impl Ui {
         };
         if workspace == Workspace::Proxy && !attached_daemon && ui.needs_onboarding() {
             ui.modal = Modal::Onboarding;
+            ui.onboarding_checked = true;
         }
         ui
     }
@@ -277,17 +278,35 @@ impl Ui {
     }
 
     pub fn needs_onboarding(&self) -> bool {
-        self.eligible_accounts() == 0
-            || self.runtime_state() == RuntimeState::Stopped
-            || !self.integration_enabled()
+        let pool_empty = !self
+            .index
+            .accounts
+            .iter()
+            .any(|account| account.proxy_enabled);
+        let integration_drifted = self.snapshot.as_ref().map_or_else(
+            || {
+                matches!(
+                    crate::integration::CodexIntegration::new(&self.config.codex_home).status(),
+                    Ok(crate::integration::IntegrationStatus::Drifted(_))
+                )
+            },
+            |snapshot| {
+                matches!(
+                    &snapshot.integration_state,
+                    crate::integration::IntegrationStatus::Drifted(_)
+                )
+            },
+        );
+        !self.config.onboarding_acknowledged || pool_empty || integration_drifted
     }
 
     pub fn switch_workspace(&mut self, workspace: Workspace) {
         self.workspace = workspace;
         self.detail = None;
         self.modal = Modal::None;
-        if workspace == Workspace::Proxy && self.needs_onboarding() {
+        if workspace == Workspace::Proxy && !self.onboarding_checked && self.needs_onboarding() {
             self.modal = Modal::Onboarding;
+            self.onboarding_checked = true;
         }
     }
 
@@ -302,6 +321,11 @@ impl Ui {
             }
             history.push_back(value);
         }
+    }
+
+    pub fn clamp_event_selection(&mut self) {
+        let length = self.recent_requests.len() + self.recent_events.len();
+        self.event_selected = self.event_selected.min(length.saturating_sub(1));
     }
 }
 
@@ -334,4 +358,40 @@ pub fn run_interactive_tui(
     terminal.show_cursor()?;
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::CheckStatus;
+
+    #[test]
+    fn acknowledged_onboarding_does_not_return_just_because_proxy_is_stopped() {
+        let mut config = Config::defaults();
+        config.onboarding_acknowledged = true;
+        config.codex_home = std::env::temp_dir().join(format!(
+            "codex-switcher-onboarding-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let index = AccountIndex {
+            accounts: vec![Account {
+                id: uuid::Uuid::new_v4(),
+                label: "test".into(),
+                source: "test".into(),
+                imported_at: chrono::Utc::now(),
+                email: None,
+                plan: None,
+                account_id: None,
+                status: CheckStatus::default(),
+                tenant_id: "local".into(),
+                proxy_enabled: true,
+            }],
+        };
+        let mut ui = Ui::new(config, index, None, Workspace::Accounts);
+        assert_eq!(ui.runtime_state(), RuntimeState::Stopped);
+        assert!(!ui.needs_onboarding());
+
+        ui.config.onboarding_acknowledged = false;
+        assert!(ui.needs_onboarding());
+    }
 }

@@ -9,7 +9,9 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Sparkline, Wrap},
+    widgets::{
+        Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Sparkline, Wrap,
+    },
 };
 
 const ACCOUNT_HELP: &str = "账户管理\n\nj/k 选择账户    Enter 直接启用    r/R 检测\na 导入当前认证  i 导入 JSON/路径  n 重命名  d 删除\n/ 过滤           t 切换主题       m 切换工作区\n\nEsc 关闭详情/弹窗 · q 或 Ctrl-C 退出";
@@ -502,13 +504,17 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
     metric_spark(
         frame,
         columns[3],
-        "RPS · 1 min",
-        &format!(
-            "{:.2}",
-            ui.metrics_1m.as_ref().map_or(0.0, |metrics| metrics.rps)
-        ),
+        MetricSparkSpec {
+            title: "RPS · 1 min",
+            value: format!(
+                "{:.2} req/s",
+                ui.metrics_1m.as_ref().map_or(0.0, |metrics| metrics.rps)
+            ),
+            divisor: 1000.0,
+            minimum_max: 1000,
+            color: theme.focus,
+        },
         &ui.request_history,
-        theme.focus,
         theme,
     );
     let success = ui.metrics.as_ref().map_or_else(
@@ -540,15 +546,21 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
     metric_spark(
         frame,
         columns[5],
-        "TTFB p95",
-        &ui.metrics
-            .as_ref()
-            .and_then(|metrics| metrics.ttfb_p95_ms)
-            .or_else(|| stats.and_then(|stats| stats.last_ttfb_ms))
-            .unwrap_or(0)
-            .to_string(),
+        MetricSparkSpec {
+            title: "TTFB p95",
+            value: format!(
+                "{} ms",
+                ui.metrics
+                    .as_ref()
+                    .and_then(|metrics| metrics.ttfb_p95_ms)
+                    .or_else(|| stats.and_then(|stats| stats.last_ttfb_ms))
+                    .unwrap_or(0)
+            ),
+            divisor: 1.0,
+            minimum_max: 100,
+            color: theme.warning,
+        },
         &ui.ttfb_history,
-        theme.warning,
         theme,
     );
 }
@@ -823,10 +835,6 @@ fn draw_events(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: sup
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(
-                        if selected { "› " } else { "  " },
-                        Style::default().fg(theme.focus),
-                    ),
-                    Span::styled(
                         format!("{} {}", request.method, request.path),
                         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                     ),
@@ -869,10 +877,6 @@ fn draw_events(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: sup
         ListItem::new(vec![
             Line::from(vec![
                 Span::styled(
-                    if selected { "› " } else { "  " },
-                    Style::default().fg(theme.focus),
-                ),
-                Span::styled(
                     &event.kind,
                     Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                 ),
@@ -895,7 +899,8 @@ fn draw_events(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: sup
             theme.surface
         }))
     }));
-    let items = if items.is_empty() {
+    let empty = items.is_empty();
+    let items = if empty {
         vec![ListItem::new(vec![
             Line::from("  暂无近期事件"),
             Line::from(Span::styled(
@@ -906,9 +911,20 @@ fn draw_events(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: sup
     } else {
         items
     };
-    frame.render_widget(
-        List::new(items).block(panel_block(theme, "4  近期事件", focused)),
+    let total = ui.recent_requests.len() + ui.recent_events.len();
+    let title = if total == 0 {
+        "4  近期事件".to_string()
+    } else {
+        format!("4  近期事件 · {}/{}", ui.event_selected + 1, total)
+    };
+    let mut state = ListState::default().with_selected((!empty).then_some(ui.event_selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().bg(theme.selected_bg))
+            .block(panel_block(theme, &title, focused)),
         area,
+        &mut state,
     );
 }
 
@@ -1204,8 +1220,8 @@ fn draw_modal(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
             30,
         ),
         Modal::ConfirmProxyStop => (
-            "停止数据代理",
-            "活动请求最多排空 30 秒；不会停止附着 daemon 的控制面。\n\n按 y 确认 · Esc 取消",
+            "停止代理并恢复 Codex",
+            "活动请求最多排空 30 秒，随后关闭 Codex 接入并恢复原配置；控制面仍可用。\n\n按 y 确认 · Esc 取消",
             68,
             32,
         ),
@@ -1223,7 +1239,7 @@ fn draw_modal(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
         ),
         Modal::Onboarding => (
             "首次设置代理",
-            "1  选择账户\n   检测账户，并在账户池按 Space 明确加入\n\n2  启动代理\n   至少一个新鲜健康账户入池后才能启动\n\n3  接入 Codex\n   安全写入 model_provider，随后重启 Codex\n\n按 1 前往账户池 · 2 启动 · 3 配置接入 · Esc 暂时关闭",
+            "1  选择账户\n   检测账户，并在账户池按 Space 明确加入\n\n2  启动代理\n   至少一个新鲜健康账户入池后才能启动\n\n3  接入 Codex\n   使用 openai_base_url 接入，保留原 sessions\n\n按 1 前往账户池 · 2 启动 · 3 配置接入 · Esc 关闭",
             78,
             70,
         ),
@@ -1264,35 +1280,90 @@ fn metric_card(
     );
 }
 
+struct MetricSparkSpec<'a> {
+    title: &'a str,
+    value: String,
+    divisor: f64,
+    minimum_max: u64,
+    color: Color,
+}
+
 fn metric_spark(
     frame: &mut Frame,
     area: Rect,
-    title: &str,
-    value: &str,
+    spec: MetricSparkSpec<'_>,
     history: &std::collections::VecDeque<u64>,
-    color: Color,
     theme: super::ThemeColors,
 ) {
-    let outer = panel_block(theme, title, false);
+    let outer = panel_block(theme, spec.title, false);
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
     frame.render_widget(
-        Paragraph::new(value).alignment(Alignment::Center).style(
-            Style::default()
-                .fg(color)
-                .bg(theme.surface)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Paragraph::new(spec.value)
+            .alignment(Alignment::Center)
+            .style(
+                Style::default()
+                    .fg(spec.color)
+                    .bg(theme.surface)
+                    .add_modifier(Modifier::BOLD),
+            ),
         rows[0],
     );
     let data = history.iter().copied().collect::<Vec<_>>();
+    let axis_max = nice_axis_max(
+        data.iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(spec.minimum_max),
+    );
+    let plot = Layout::horizontal([Constraint::Length(6), Constraint::Min(1)]).split(rows[1]);
+    let midpoint = axis_max / 2;
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(format_axis(axis_max, spec.divisor)),
+            Line::from(format_axis(midpoint, spec.divisor)),
+            Line::from(""),
+            Line::from(format_axis(0, spec.divisor)),
+        ])
+        .alignment(Alignment::Right)
+        .style(Style::default().fg(theme.muted).bg(theme.surface)),
+        plot[0],
+    );
     frame.render_widget(
         Sparkline::default()
             .data(&data)
-            .style(Style::default().fg(color).bg(theme.surface)),
-        rows[1],
+            .max(axis_max)
+            .style(Style::default().fg(spec.color).bg(theme.surface)),
+        plot[1],
     );
+}
+
+fn nice_axis_max(value: u64) -> u64 {
+    if value <= 1 {
+        return 1;
+    }
+    let magnitude = 10u64.pow(value.ilog10());
+    let normalized = value.div_ceil(magnitude);
+    let step = match normalized {
+        0..=1 => 1,
+        2 => 2,
+        3..=5 => 5,
+        _ => 10,
+    };
+    step * magnitude
+}
+
+fn format_axis(value: u64, divisor: f64) -> String {
+    let scaled = value as f64 / divisor;
+    if scaled >= 100.0 || scaled.fract() == 0.0 {
+        format!("{scaled:.0} ┤")
+    } else if scaled >= 10.0 {
+        format!("{scaled:.1} ┤")
+    } else {
+        format!("{scaled:.2} ┤")
+    }
 }
 
 fn draw_quota(
@@ -1480,17 +1551,61 @@ mod tests {
             None,
             Workspace::Proxy,
         );
+        // Do not let a real daemon in the developer's home directory decide
+        // whether this isolated renderer test shows onboarding.
+        ui.modal = Modal::Onboarding;
         let onboarding = rendered_ui(120, 34, &ui);
         assert!(onboarding.contains("首 次 设 置 代 理"), "{onboarding}");
 
         ui.modal = Modal::ConfirmProxyStop;
         let confirmation = rendered_ui(120, 34, &ui);
-        assert!(confirmation.contains("停 止 数 据 代 理"), "{confirmation}");
+        assert!(
+            confirmation.contains("停 止 代 理 并 恢 复"),
+            "{confirmation}"
+        );
 
         ui.modal = Modal::None;
         ui.detail = Some(DetailPage::Control);
         let detail = rendered_ui(120, 34, &ui);
         assert!(detail.contains("代 理 控 制 详 情"), "{detail}");
         assert!(detail.contains("Esc 返 回"), "{detail}");
+    }
+
+    #[test]
+    fn recent_events_scrolls_to_keep_the_selection_visible() {
+        let mut ui = Ui::new(
+            Config::defaults(),
+            AccountIndex::default(),
+            None,
+            Workspace::Proxy,
+        );
+        ui.modal = Modal::None;
+        ui.proxy_panel = ProxyPanel::Events;
+        ui.recent_events = (0..12)
+            .map(|index| crate::storage::RuntimeEvent {
+                id: index.to_string(),
+                occurred_at: chrono::Utc::now(),
+                tenant_id: "local".into(),
+                device_id: "test".into(),
+                client_instance_id: None,
+                kind: format!("event-{index}"),
+                account_id: None,
+                detail: "safe metadata".into(),
+            })
+            .collect();
+        ui.event_selected = 11;
+
+        let screen = rendered_ui(120, 24, &ui);
+        assert!(screen.contains("12/12"), "{screen}");
+        assert!(screen.contains("event-11"), "{screen}");
+        assert!(!screen.contains("event-0"), "{screen}");
+    }
+
+    #[test]
+    fn metric_axis_uses_stable_nice_bounds() {
+        assert_eq!(nice_axis_max(0), 1);
+        assert_eq!(nice_axis_max(37), 50);
+        assert_eq!(nice_axis_max(101), 200);
+        assert_eq!(format_axis(500, 1000.0), "0.50 ┤");
     }
 }

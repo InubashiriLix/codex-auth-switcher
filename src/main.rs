@@ -14,16 +14,8 @@ use codex_switcher::{
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() -> Result<()> {
-    // 初始化日志
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "codex_switcher=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
     let cli = Cli::parse();
+    init_tracing(terminal_logging_enabled(&cli));
     let p = paths();
 
     // 处理守护进程控制命令（同步）
@@ -32,6 +24,9 @@ fn main() -> Result<()> {
     }
 
     let mut config = load_config(&p)?;
+    // Healthy v1 integrations used a distinct provider id, which made Codex
+    // hide older sessions. Upgrade it before the TUI or daemon starts.
+    codex_switcher::integration::CodexIntegration::new(&config.codex_home).migrate_if_needed()?;
     if cli.auto_switch {
         config.proxy.auto_switch = true;
     }
@@ -48,6 +43,30 @@ fn main() -> Result<()> {
         run_proxy_tui(config, index, p)
     } else {
         codex_switcher::tui::start_interactive(config, index, None)
+    }
+}
+
+fn terminal_logging_enabled(cli: &Cli) -> bool {
+    cli.daemon
+}
+
+/// A ratatui application owns the terminal while it is running. Writing
+/// tracing output to stdout/stderr at the same time corrupts the alternate
+/// screen, so only the headless daemon gets a terminal log layer. Proxy work
+/// performed by an embedded daemon inherits the silent TUI subscriber.
+fn init_tracing(log_to_terminal: bool) {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "codex_switcher=info".into());
+    if log_to_terminal {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::sink))
+            .init();
     }
 }
 
@@ -198,5 +217,25 @@ fn handle_daemon_command_sync(command: &Commands, paths: &Paths) -> Result<()> {
             println!("重载信号已发送");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_headless_daemon_writes_tracing_to_the_terminal() {
+        assert!(!terminal_logging_enabled(&Cli::parse_from([
+            "codex-switcher"
+        ])));
+        assert!(!terminal_logging_enabled(&Cli::parse_from([
+            "codex-switcher",
+            "--proxy",
+        ])));
+        assert!(terminal_logging_enabled(&Cli::parse_from([
+            "codex-switcher",
+            "--daemon",
+        ])));
     }
 }

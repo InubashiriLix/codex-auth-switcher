@@ -50,6 +50,8 @@ pub struct MetricBucket {
     pub requests: u64,
     pub failures: u64,
     pub average_ttfb_ms: Option<u64>,
+    #[serde(default)]
+    pub ttfb_p95_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -322,6 +324,7 @@ impl MetadataStore {
             .collect::<Vec<_>>();
         let mut ttfb_totals = vec![0u64; bucket_count];
         let mut ttfb_counts = vec![0u64; bucket_count];
+        let mut bucket_ttfb = vec![Vec::<u64>::new(); bucket_count];
         for request in &requests {
             let elapsed = request
                 .started_at
@@ -340,11 +343,14 @@ impl MetadataStore {
             if let Some(value) = request.ttfb_ms {
                 ttfb_totals[index] += value;
                 ttfb_counts[index] += 1;
+                bucket_ttfb[index].push(value);
             }
         }
         for (index, bucket) in buckets.iter_mut().enumerate() {
             bucket.average_ttfb_ms =
                 (ttfb_counts[index] > 0).then(|| ttfb_totals[index] / ttfb_counts[index]);
+            bucket_ttfb[index].sort_unstable();
+            bucket.ttfb_p95_ms = percentile(&bucket_ttfb[index], 95);
         }
         Ok(MetricsWindow {
             window_seconds,
@@ -499,6 +505,10 @@ mod tests {
         assert_eq!(metrics.successful_requests, 2);
         assert_eq!(metrics.ttfb_p50_ms, Some(50));
         assert_eq!(metrics.ttfb_p95_ms, Some(90));
+        assert_eq!(
+            metrics.buckets.iter().find_map(|bucket| bucket.ttfb_p95_ms),
+            Some(90)
+        );
         assert_eq!(
             metrics
                 .buckets

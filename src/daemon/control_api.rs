@@ -440,6 +440,9 @@ async fn handle(
                 if let Some(value) = patch.strategy {
                     config.proxy.strategy = value;
                 }
+                if let Some(value) = patch.onboarding_acknowledged {
+                    config.onboarding_acknowledged = value;
+                }
                 context
                     .proxy_server
                     .router()
@@ -515,10 +518,54 @@ async fn handle(
             );
             let mut config = context.config.read().clone();
             config.proxy.enabled = false;
-            if save_config(&context.paths, &config).is_ok() {
+            let config_result = save_config(&context.paths, &config);
+            if config_result.is_ok() {
                 *context.config.write() = config;
             }
-            json_response(StatusCode::OK, json!({"ok":true,"drained":drained}))
+            let integration_result =
+                CodexIntegration::new(&context.config.read().codex_home).disable();
+            match (config_result, integration_result) {
+                (Ok(()), Ok(())) => {
+                    record_control_event(
+                        &context,
+                        "integration_disabled",
+                        None,
+                        "停止代理时已同步停用 Codex 接入",
+                    );
+                    json_response(
+                        StatusCode::OK,
+                        json!({
+                            "ok": true,
+                            "proxy_stopped": true,
+                            "drained": drained,
+                            "config_saved": true,
+                            "integration_disabled": true
+                        }),
+                    )
+                }
+                (config_result, integration_result) => {
+                    let config_saved = config_result.is_ok();
+                    let integration_disabled = integration_result.is_ok();
+                    let mut errors = Vec::new();
+                    if let Err(error) = config_result {
+                        errors.push(format!("停止状态保存失败：{error}"));
+                    }
+                    if let Err(error) = integration_result {
+                        errors.push(format!("Codex 接入恢复失败：{error}"));
+                    }
+                    json_response(
+                        StatusCode::CONFLICT,
+                        json!({
+                            "ok": false,
+                            "proxy_stopped": true,
+                            "drained": drained,
+                            "config_saved": config_saved,
+                            "integration_disabled": integration_disabled,
+                            "error": format!("代理已停止，但{}", errors.join("；"))
+                        }),
+                    )
+                }
+            }
         }
         (Method::POST, "/v1/integration/enable") => {
             let result = CodexIntegration::new(&context.config.read().codex_home).enable();
@@ -647,6 +694,7 @@ struct ConfigPatch {
     auto_switch: Option<bool>,
     threshold: Option<f64>,
     strategy: Option<RecommendStrategy>,
+    onboarding_acknowledged: Option<bool>,
 }
 #[derive(Deserialize)]
 struct PoolPatch {
@@ -862,6 +910,7 @@ mod tests {
         };
         let mut config = Config::defaults();
         config.accounts_dir = root.join("accounts");
+        config.codex_home = root.join("codex");
         let accounts = Arc::new(RwLock::new(AccountIndex::default()));
         let current = Arc::new(RwLock::new(None));
         let proxy_state = ProxyState::new();
@@ -971,6 +1020,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(String::from_utf8_lossy(&first).contains("event: snapshot"));
+
+        let stop_response = client
+            .post(format!("http://{}/v1/proxy/stop", descriptor.address))
+            .bearer_auth(&descriptor.bearer_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stop_response.status(), StatusCode::OK);
+        let stop_body: serde_json::Value = stop_response.json().await.unwrap();
+        assert_eq!(stop_body["proxy_stopped"], true);
+        assert_eq!(stop_body["config_saved"], true);
+        assert_eq!(stop_body["integration_disabled"], true);
+
+        let persisted = crate::config::load_config(&paths).unwrap();
+        assert!(!persisted.proxy.enabled);
+        assert_eq!(
+            CodexIntegration::new(&persisted.codex_home)
+                .status()
+                .unwrap(),
+            crate::integration::IntegrationStatus::Disabled
+        );
         let _ = shutdown.send(true);
         task.await.unwrap().unwrap();
         assert!(!paths.runtime_file.exists());

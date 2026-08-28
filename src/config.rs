@@ -14,6 +14,8 @@ pub struct Config {
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub onboarding_acknowledged: bool,
 }
 
 impl Config {
@@ -33,6 +35,7 @@ impl Config {
             mode: OperationMode::Interactive,
             proxy: ProxyConfig::default(),
             retention: RetentionConfig::default(),
+            onboarding_acknowledged: false,
         }
     }
 }

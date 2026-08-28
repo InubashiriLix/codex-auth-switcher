@@ -7,6 +7,7 @@ codex_home = "/home/user/.codex"
 
 # 账户快照存储目录
 accounts_dir = "/home/user/.local/share/codex-switcher/accounts"
+onboarding_acknowledged = false
 
 # TUI主题：midnight（默认）, nord, gruvbox, paper
 theme = "midnight"

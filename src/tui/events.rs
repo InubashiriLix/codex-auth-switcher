@@ -309,6 +309,13 @@ fn move_proxy_selection(ui: &mut Ui, down: bool) {
 }
 
 fn open_proxy_detail(ui: &mut Ui) {
+    if ui.proxy_panel == ProxyPanel::Events
+        && ui.recent_requests.is_empty()
+        && ui.recent_events.is_empty()
+    {
+        ui.notice = "暂无可查看的近期事件".into();
+        return;
+    }
     ui.detail = match ui.proxy_panel {
         ProxyPanel::Control => Some(DetailPage::Control),
         ProxyPanel::Pool => ui
@@ -440,8 +447,28 @@ fn stop_proxy(paths: &Paths, ui: &mut Ui) {
         Method::POST,
         "/v1/proxy/stop",
         None,
-        "数据代理已停止，控制面仍可用",
+        "代理与 Codex 接入均已关闭；请重启 Codex",
     );
+}
+
+fn acknowledge_onboarding(paths: &Paths, ui: &mut Ui) {
+    if ui.config.onboarding_acknowledged {
+        return;
+    }
+    ui.config.onboarding_acknowledged = true;
+    if let Err(error) = crate::config::save_config(paths, &ui.config) {
+        ui.notice = format!("首次设置状态保存失败：{error}");
+    }
+    if ui.attached_daemon {
+        enqueue_control(
+            paths,
+            ui,
+            Method::PATCH,
+            "/v1/config",
+            Some(json!({"onboarding_acknowledged":true})),
+            "首次设置提示已记住",
+        );
+    }
 }
 
 fn set_auto_switch(paths: &Paths, ui: &mut Ui, enabled: bool) {
@@ -552,6 +579,9 @@ fn set_integration(paths: &Paths, ui: &mut Ui, enabled: bool) {
 
 fn handle_modal(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
     if key.code == KeyCode::Esc {
+        if ui.modal == Modal::Onboarding {
+            acknowledge_onboarding(paths, ui);
+        }
         ui.modal = Modal::None;
         ui.input.clear();
         return Ok(false);
@@ -564,6 +594,7 @@ fn handle_modal(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
         },
         Modal::Onboarding => match key.code {
             KeyCode::Char('1') => {
+                acknowledge_onboarding(paths, ui);
                 if ui.index.accounts.is_empty() {
                     ui.switch_workspace(Workspace::Accounts);
                     ui.notice = "按 a 导入当前 Codex 登录，或按 i 导入 JSON/路径".into();
@@ -574,10 +605,12 @@ fn handle_modal(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
                 }
             }
             KeyCode::Char('2') => {
+                acknowledge_onboarding(paths, ui);
                 ui.modal = Modal::None;
                 start_proxy(paths, ui);
             }
             KeyCode::Char('3') => {
+                acknowledge_onboarding(paths, ui);
                 ui.modal = if ui.integration_enabled() {
                     Modal::ConfirmIntegrationDisable
                 } else {
@@ -833,5 +866,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ui.workspace, Workspace::Proxy);
+    }
+
+    #[test]
+    fn event_navigation_clamps_at_both_ends() {
+        let mut ui = ui();
+        ui.workspace = Workspace::Proxy;
+        ui.proxy_panel = ProxyPanel::Events;
+        ui.recent_events = (0..3)
+            .map(|index| crate::storage::RuntimeEvent {
+                id: index.to_string(),
+                occurred_at: chrono::Utc::now(),
+                tenant_id: "local".into(),
+                device_id: "test".into(),
+                client_instance_id: None,
+                kind: format!("event-{index}"),
+                account_id: None,
+                detail: "safe".into(),
+            })
+            .collect();
+        let root = crate::paths::paths();
+        for _ in 0..5 {
+            handle_key(key('j'), &root, &mut ui).unwrap();
+        }
+        assert_eq!(ui.event_selected, 2);
+        for _ in 0..5 {
+            handle_key(key('k'), &root, &mut ui).unwrap();
+        }
+        assert_eq!(ui.event_selected, 0);
+
+        ui.event_selected = 2;
+        ui.recent_events.truncate(1);
+        ui.clamp_event_selection();
+        assert_eq!(ui.event_selected, 0);
     }
 }
