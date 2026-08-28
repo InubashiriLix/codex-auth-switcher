@@ -1,0 +1,22 @@
+name: Bug report
+description: Report a reproducible problem with Codex Switcher
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Please redact tokens, emails, home paths, and account snapshots before posting."
+  - type: textarea
+    id: repro
+    attributes:
+      label: What happened?
+      description: Include the command, key sequence, and expected behavior.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, terminal, Rust version, and Codex CLI version
+    validations:
+      required: true
