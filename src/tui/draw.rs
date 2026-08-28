@@ -1,4 +1,4 @@
-use super::{Modal, Ui};
+use super::{Modal, Ui, UiTab};
 use crate::types::{Quota, StatusKind};
 use chrono::Local;
 use ratatui::{
@@ -10,8 +10,8 @@ use ratatui::{
 };
 use std::sync::atomic::Ordering;
 
-const HELP_TEXT: &str = "j/k 或 ↑/↓ 移动 · Ctrl-n/Ctrl-p 翻页 · Enter 启用
-a 当前认证 · i 路径/JSON · n 重命名 · d 删除
+const HELP_TEXT: &str = "Tab/Shift-Tab 切页 · j/k 或 ↑/↓ 移动 · Enter 查看/操作
+Space 加入/移出代理池 · p 暂停路由 · x 手动切换
 r 单个检测 · R 全部检测 · / 过滤 · s 设置 · t 切换主题
 Ctrl-C 退出程序
 Use q or Esc to exit this helper window";
@@ -49,10 +49,46 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
         ""
     };
 
+    let live_accounts = ui
+        .index
+        .accounts
+        .iter()
+        .filter(|a| a.proxy_enabled && a.status.kind == StatusKind::Live)
+        .count();
+    let integration = crate::integration::CodexIntegration::new(&ui.config.codex_home)
+        .status()
+        .map(|status| matches!(status, crate::integration::IntegrationStatus::Enabled))
+        .unwrap_or(false);
+    let tabs = UiTab::ALL
+        .iter()
+        .map(|tab| {
+            if *tab == ui.tab {
+                format!("[{}]", tab.label())
+            } else {
+                tab.label().into()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let title = format!(
-        " Codex Switcher  ·  当前: {}  ·  {} 个账户{}",
+        " Codex Switcher · {tabs} · 当前: {} · 代理{} · 接入{} · 自动{} · 健康{}{}",
         active_label,
-        ui.index.accounts.len(),
+        if ui
+            .proxy_state
+            .as_ref()
+            .is_some_and(|p| p.running.load(Ordering::Relaxed))
+        {
+            "运行"
+        } else {
+            "停止"
+        },
+        if integration { "开" } else { "关" },
+        if ui.config.proxy.auto_switch {
+            "开"
+        } else {
+            "关"
+        },
+        live_accounts,
         proxy_status
     );
 
@@ -74,6 +110,24 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
         .block(block(theme, "")),
         areas[0],
     );
+
+    if ui.tab != UiTab::Accounts {
+        draw_tab_page(f, areas[1], ui, theme);
+        f.render_widget(
+            Paragraph::new(format!(" {}", ui.notice))
+                .style(Style::default().fg(theme.muted).bg(theme.background))
+                .block(
+                    Block::default()
+                        .borders(Borders::TOP)
+                        .style(Style::default().fg(theme.border).bg(theme.background)),
+                ),
+            areas[2],
+        );
+        if ui.modal != Modal::None {
+            draw_modal(f, ui, theme);
+        }
+        return;
+    }
 
     // 主内容区
     let chunks = Layout::default()
@@ -240,7 +294,146 @@ pub fn draw(f: &mut Frame, ui: &Ui) {
     }
 }
 
-fn draw_quota(f: &mut Frame, area: Rect, title: &str, q: Option<&Quota>, theme: super::ThemeColors) {
+fn draw_tab_page(f: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors) {
+    let stats = ui
+        .proxy_state
+        .as_ref()
+        .map(|state| state.stats.read().clone())
+        .unwrap_or_default();
+    let integration = crate::integration::CodexIntegration::new(&ui.config.codex_home).status();
+    let lines = match ui.tab {
+        UiTab::Overview => vec![
+            Line::from(format!(
+                "代理健康：{}  ·  控制面：{}  ·  监听：{}",
+                if ui
+                    .proxy_state
+                    .as_ref()
+                    .is_some_and(|p| p.running.load(Ordering::Relaxed))
+                {
+                    "运行中"
+                } else {
+                    "未运行"
+                },
+                if ui.attached_daemon {
+                    "已附着 daemon"
+                } else {
+                    "本地管理"
+                },
+                ui.config.proxy.listen_addr
+            )),
+            Line::from(format!(
+                "流量：总请求 {}  ·  上游响应 {}  ·  失败 {}  ·  重试 {}",
+                stats.total_requests,
+                stats.upstream_responses,
+                stats.failed_requests,
+                stats.retries
+            )),
+            Line::from(format!(
+                "状态码：401 {}  ·  403 {}  ·  429 {}  ·  5xx {}  ·  中途断流 {}",
+                stats.http_401,
+                stats.http_403,
+                stats.http_429,
+                stats.http_5xx,
+                stats.partial_failures
+            )),
+            Line::from(format!(
+                "性能：最近 TTFB {} ms  ·  下行 {} bytes",
+                stats
+                    .last_ttfb_ms
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "--".into()),
+                stats.response_bytes
+            )),
+        ],
+        UiTab::Instances => {
+            let mut lines = vec![
+                Line::from("本地 Codex 实例（端口映射权限不足时显示未知进程）"),
+                Line::from(format!("活动连接/请求：{}", ui.active_requests.len())),
+                Line::from("身份优先级：可信会话 → PID+启动时间 → 连接标识"),
+            ];
+            for request in ui.active_requests.iter().take(12) {
+                let pid = request
+                    .pointer("/identity/process/pid")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "未知".into());
+                let cwd = request
+                    .pointer("/identity/process/working_directory")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("未知工作目录");
+                let method = request
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                let path = request
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                lines.push(Line::from(format!("PID {pid} · {cwd} · {method} {path}")));
+            }
+            lines
+        }
+        UiTab::Events => vec![
+            Line::from("仅展示请求摘要、刷新、切换、断流和配置事件。"),
+            Line::from("不会记录提示词、代码、模型输出、Authorization 或 token。"),
+            Line::from(format!(
+                "本次运行：请求 {}，失败 {}，partial failure {}",
+                stats.total_requests, stats.failed_requests, stats.partial_failures
+            )),
+        ],
+        UiTab::Settings => vec![
+            Line::from(format!(
+                "运行模式：{}",
+                if ui.attached_daemon {
+                    "附着 daemon"
+                } else {
+                    "本地/内嵌"
+                }
+            )),
+            Line::from(format!(
+                "Codex 全局接入：{}",
+                match integration {
+                    Ok(crate::integration::IntegrationStatus::Enabled) =>
+                        "已启用（Enter 停用）".into(),
+                    Ok(crate::integration::IntegrationStatus::Disabled) =>
+                        "未启用（Enter 启用）".into(),
+                    Ok(crate::integration::IntegrationStatus::Drifted(diff)) =>
+                        format!("配置漂移：{diff}"),
+                    Err(e) => e.to_string(),
+                }
+            )),
+            Line::from(format!(
+                "自动切换：{}  ·  策略：{:?}  ·  阈值：{:.0}%",
+                if ui.config.proxy.auto_switch {
+                    "开启"
+                } else {
+                    "关闭"
+                },
+                ui.config.proxy.strategy,
+                ui.config.proxy.threshold
+            )),
+            Line::from("历史保留：7 天 / 50,000 请求摘要 / 10,000 事件"),
+            Line::from("启用或停用 provider 后，需要重启正在运行的 Codex。"),
+            Line::from("Space 开关自动切换；Enter 启用/停用 Codex provider。"),
+        ],
+        UiTab::Accounts => unreachable!(),
+    };
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(theme.text).bg(theme.surface))
+            .block(block(theme, ui.tab.label())),
+        area,
+    );
+}
+
+fn draw_quota(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    q: Option<&Quota>,
+    theme: super::ThemeColors,
+) {
     let Some(q) = q else {
         f.render_widget(
             Paragraph::new("尚无额度数据\n按 r 检测此账户 · R 检测全部")
@@ -263,7 +456,7 @@ fn draw_quota(f: &mut Frame, area: Rect, title: &str, q: Option<&Quota>, theme: 
         .map(|minutes| format!("{} 分钟", minutes))
         .unwrap_or_else(|| "未知窗口".into());
 
-    let ratio = ((100. - q.used_percent).clamp(0., 100.) / 100.) as f64;
+    let ratio = (100. - q.used_percent).clamp(0., 100.) / 100.;
     let label = format!(
         "{:.0}% 剩余 · {window} · 重置 {reset}",
         (100. - q.used_percent).max(0.)
@@ -397,6 +590,14 @@ fn draw_modal(f: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
             "1. 交互模式（当前）\n2. 代理模式（手动）\n3. 代理模式（自动）\n\nEsc 取消",
         ),
         Modal::ProxySettings => ("代理设置", ui.input.as_str()),
+        Modal::ConfirmIntegrationEnable => (
+            "确认启用 Codex 全局代理接入",
+            "将安全修改 $CODEX_HOME/config.toml 并创建完整备份。按 y 确认；Esc 取消。",
+        ),
+        Modal::ConfirmIntegrationDisable => (
+            "确认停用 Codex 全局代理接入",
+            "仅恢复本工具管理的配置键；检测到外部漂移时会拒绝覆盖。按 y 确认；Esc 取消。",
+        ),
         Modal::None => unreachable!(),
     };
 
@@ -435,7 +636,10 @@ fn centered(x: u16, y: u16, area: Rect) -> Rect {
         .split(v[1])[1]
 }
 
-fn status_style(theme: super::ThemeColors, kind: &StatusKind) -> (ratatui::style::Color, &'static str) {
+fn status_style(
+    theme: super::ThemeColors,
+    kind: &StatusKind,
+) -> (ratatui::style::Color, &'static str) {
     match kind {
         StatusKind::Live => (theme.success, "✓ 可用"),
         StatusKind::Exhausted => (theme.error, "✗ 耗尽"),
@@ -454,11 +658,51 @@ fn active_account_id(ui: &Ui) -> Option<uuid::Uuid> {
 
     let active_content = std::fs::read(&active_path).ok()?;
 
-    ui.index.accounts.iter().find(|a| {
-        let snapshot_path = crate::account::snapshot_path(&ui.config, a.id);
-        std::fs::read(&snapshot_path)
-            .ok()
-            .map(|content| content == active_content)
-            .unwrap_or(false)
-    }).map(|a| a.id)
+    ui.index
+        .accounts
+        .iter()
+        .find(|a| {
+            let snapshot_path = crate::account::snapshot_path(&ui.config, a.id);
+            std::fs::read(&snapshot_path)
+                .ok()
+                .map(|content| content == active_content)
+                .unwrap_or(false)
+        })
+        .map(|a| a.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config, types::AccountIndex};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn rendered(width: u16, height: u16, tab: UiTab) -> String {
+        let mut ui = Ui::new(Config::defaults(), AccountIndex::default(), None);
+        ui.tab = tab;
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, &ui)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn overview_keeps_proxy_status_visible() {
+        let screen = rendered(100, 30, UiTab::Overview);
+        assert!(screen.contains("代 理 健 康"), "{screen}");
+        assert!(screen.contains("总 览"), "{screen}");
+    }
+
+    #[test]
+    fn minimum_terminal_does_not_panic_or_hide_tab_identity() {
+        let screen = rendered(40, 10, UiTab::Settings);
+        assert!(screen.contains("设 置"), "{screen}");
+    }
 }

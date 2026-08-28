@@ -2,7 +2,7 @@ use crate::{error::*, paths::Paths};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::{
     path::PathBuf,
-    sync::mpsc::{channel, Receiver},
+    sync::mpsc::{Receiver, channel},
 };
 
 #[derive(Debug, Clone)]
@@ -26,11 +26,10 @@ impl HotReloader {
     pub fn new(paths: &Paths) -> Result<Self> {
         let (tx, rx) = channel();
 
-        let mut watcher: RecommendedWatcher = notify::recommended_watcher(
-            move |res: notify::Result<Event>| {
+        let mut watcher: RecommendedWatcher =
+            notify::recommended_watcher(move |res: notify::Result<Event>| {
                 let _ = tx.send(res);
-            },
-        )?;
+            })?;
 
         // 监控配置文件
         if paths.config_file.exists() {

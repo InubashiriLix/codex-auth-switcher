@@ -8,6 +8,8 @@ pub struct Paths {
     pub index_file: PathBuf,
     pub config_dir: PathBuf,
     pub pid_file: PathBuf,
+    pub runtime_file: PathBuf,
+    pub database_file: PathBuf,
 }
 
 pub fn paths() -> Paths {
@@ -32,5 +34,7 @@ pub fn paths() -> Paths {
         index_file: data.join("accounts.toml"),
         config_dir,
         pid_file: runtime_dir.join(format!("{APP}.pid")),
+        runtime_file: runtime_dir.join(format!("{APP}.runtime.json")),
+        database_file: data.join("runtime.sqlite3"),
     }
 }

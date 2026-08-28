@@ -48,19 +48,17 @@ impl NotificationManager {
     #[cfg(target_os = "linux")]
     fn send_notification(&self, title: &str, message: &str) {
         use notify_rust::Notification;
-        let _ = Notification::new()
-            .summary(title)
-            .body(message)
-            .show();
+        let _ = Notification::new().summary(title).body(message).show();
     }
 
     #[cfg(target_os = "macos")]
     fn send_notification(&self, title: &str, message: &str) {
         use std::process::Command;
-        let script = format!("display notification \"{}\" with title \"{}\"", message, title);
-        let _ = Command::new("osascript")
-            .args(["-e", &script])
-            .spawn();
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            message, title
+        );
+        let _ = Command::new("osascript").args(["-e", &script]).spawn();
     }
 
     #[cfg(target_os = "windows")]

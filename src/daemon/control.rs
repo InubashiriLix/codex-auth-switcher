@@ -59,8 +59,8 @@ pub fn check_daemon_status(paths: &Paths) -> Result<DaemonStatus> {
 }
 
 pub fn send_reload_signal(paths: &Paths) -> Result<()> {
-    let pid = read_pid_file(paths)?
-        .ok_or_else(|| AppError::Message("Daemon is not running".into()))?;
+    let pid =
+        read_pid_file(paths)?.ok_or_else(|| AppError::Message("Daemon is not running".into()))?;
 
     #[cfg(unix)]
     {
@@ -71,15 +71,17 @@ pub fn send_reload_signal(paths: &Paths) -> Result<()> {
 
     #[cfg(not(unix))]
     {
-        return Err(AppError::Message("Signal sending not supported on this platform".into()));
+        return Err(AppError::Message(
+            "Signal sending not supported on this platform".into(),
+        ));
     }
 
     Ok(())
 }
 
 pub fn send_stop_signal(paths: &Paths) -> Result<()> {
-    let pid = read_pid_file(paths)?
-        .ok_or_else(|| AppError::Message("Daemon is not running".into()))?;
+    let pid =
+        read_pid_file(paths)?.ok_or_else(|| AppError::Message("Daemon is not running".into()))?;
 
     #[cfg(unix)]
     {
@@ -90,7 +92,9 @@ pub fn send_stop_signal(paths: &Paths) -> Result<()> {
 
     #[cfg(not(unix))]
     {
-        return Err(AppError::Message("Signal sending not supported on this platform".into()));
+        return Err(AppError::Message(
+            "Signal sending not supported on this platform".into(),
+        ));
     }
 
     Ok(())

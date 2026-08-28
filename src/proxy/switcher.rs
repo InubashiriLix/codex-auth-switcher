@@ -6,11 +6,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
-use std::{
-    collections::VecDeque,
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::VecDeque, sync::Arc, time::Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -101,17 +97,17 @@ impl AccountSwitcher {
         };
 
         // 4. 检查使用率
-        if let Some(percent) = current_used_percent {
-            if percent >= self.config.threshold {
-                let accounts = state.accounts.read();
-                let accounts_clone = accounts.accounts.clone();
-                drop(accounts);
-                return self.recommend_switch(
-                    &accounts_clone,
-                    current_id,
-                    &format!("使用率达到 {:.1}%", percent),
-                );
-            }
+        if let Some(percent) = current_used_percent
+            && percent >= self.config.threshold
+        {
+            let accounts = state.accounts.read();
+            let accounts_clone = accounts.accounts.clone();
+            drop(accounts);
+            return self.recommend_switch(
+                &accounts_clone,
+                current_id,
+                &format!("使用率达到 {:.1}%", percent),
+            );
         }
 
         // 5. 检查账户状态
@@ -136,9 +132,16 @@ impl AccountSwitcher {
         reason: &str,
     ) -> Result<SwitchDecision> {
         // 推荐下一个账户（排除当前账户）
-        let available: Vec<_> = accounts.iter().filter(|a| a.id != current_id).cloned().collect();
+        let available: Vec<_> = accounts
+            .iter()
+            .filter(|a| a.id != current_id)
+            .cloned()
+            .collect();
 
-        if let Some(target_id) = self.recommender.recommend(&available, self.config.threshold) {
+        if let Some(target_id) = self
+            .recommender
+            .recommend(&available, self.config.threshold)
+        {
             Ok(SwitchDecision::Switch {
                 target: target_id,
                 reason: reason.to_string(),
@@ -165,12 +168,14 @@ impl AccountSwitcher {
                 .find(|a| a.id == target)
                 .ok_or_else(|| AppError::Message("目标账户不存在".into()))?;
 
-            let status = target_account.status.kind.clone();
-            status
+            target_account.status.kind.clone()
         };
 
         if target_status != StatusKind::Live {
-            return Err(AppError::Message(format!("目标账户不可用: {:?}", target_status)));
+            return Err(AppError::Message(format!(
+                "目标账户不可用: {:?}",
+                target_status
+            )));
         }
 
         // 2. 等待活跃请求完成
@@ -224,10 +229,12 @@ impl AccountSwitcher {
 
     /// 回滚到上一个账户
     pub async fn rollback(&self, state: &mut DaemonState) -> Result<()> {
-        let history = self.switch_history.read();
-        if let Some(last) = history.back() {
-            let from = last.from_account;
-            drop(history);
+        let from = self
+            .switch_history
+            .read()
+            .back()
+            .map(|last| last.from_account);
+        if let Some(from) = from {
             info!("回滚到上一个账户: {}", from);
             self.execute_switch(state, from).await?;
         } else {

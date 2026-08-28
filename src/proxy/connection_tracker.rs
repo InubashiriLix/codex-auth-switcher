@@ -1,9 +1,11 @@
+use crate::identity::RequestIdentity;
 use parking_lot::Mutex;
+use serde::Serialize;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -13,6 +15,15 @@ pub struct RequestMetadata {
     pub started_at: Instant,
     pub method: String,
     pub path: String,
+    pub identity: RequestIdentity,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct InFlightRequest {
+    pub method: String,
+    pub path: String,
+    pub elapsed_ms: u64,
+    pub identity: RequestIdentity,
 }
 
 #[derive(Clone)]
@@ -43,6 +54,19 @@ impl ConnectionTracker {
         self.active.load(Ordering::Relaxed)
     }
 
+    pub fn in_flight(&self) -> Vec<InFlightRequest> {
+        self.requests_in_flight
+            .lock()
+            .values()
+            .map(|request| InFlightRequest {
+                method: request.method.clone(),
+                path: request.path.clone(),
+                elapsed_ms: request.started_at.elapsed().as_millis() as u64,
+                identity: request.identity.clone(),
+            })
+            .collect()
+    }
+
     pub fn wait_for_drain(&self, timeout: Duration) -> bool {
         let start = Instant::now();
         loop {
@@ -54,6 +78,12 @@ impl ConnectionTracker {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+impl Default for ConnectionTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

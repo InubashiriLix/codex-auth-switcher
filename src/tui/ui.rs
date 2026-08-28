@@ -5,6 +5,40 @@ use crate::{
 };
 use std::sync::mpsc::Receiver;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiTab {
+    Overview,
+    Instances,
+    Accounts,
+    Events,
+    Settings,
+}
+
+impl UiTab {
+    pub const ALL: [Self; 5] = [
+        Self::Overview,
+        Self::Instances,
+        Self::Accounts,
+        Self::Events,
+        Self::Settings,
+    ];
+    pub fn next(self) -> Self {
+        Self::ALL[(self as usize + 1) % Self::ALL.len()]
+    }
+    pub fn previous(self) -> Self {
+        Self::ALL[(self as usize + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "总览",
+            Self::Instances => "实例",
+            Self::Accounts => "账户池",
+            Self::Events => "事件",
+            Self::Settings => "设置",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Modal {
     None,
@@ -17,6 +51,8 @@ pub enum Modal {
     Help,
     ModeSelector,
     ProxySettings,
+    ConfirmIntegrationEnable,
+    ConfirmIntegrationDisable,
 }
 
 pub struct Checking {
@@ -28,7 +64,7 @@ pub struct Checking {
 
 pub enum ProbeEvent {
     Started { label: String },
-    Completed(Account),
+    Completed(Box<Account>),
     Finished,
 }
 
@@ -43,6 +79,10 @@ pub struct Ui {
     pub tick: u64,
     pub proxy_state: Option<ProxyState>,
     pub checking: Option<Checking>,
+    pub tab: UiTab,
+    pub attached_daemon: bool,
+    pub routing_paused: bool,
+    pub active_requests: Vec<serde_json::Value>,
 }
 
 impl Ui {
@@ -58,6 +98,10 @@ impl Ui {
             tick: 0,
             proxy_state,
             checking: None,
+            tab: UiTab::Overview,
+            attached_daemon: crate::daemon::read_runtime(&crate::paths::paths()).is_ok(),
+            routing_paused: false,
+            active_requests: Vec::new(),
         }
     }
 
@@ -87,10 +131,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 
 pub fn run_interactive_tui(

@@ -8,7 +8,7 @@ pub struct Cli {
     pub command: Option<Commands>,
 
     /// Enable proxy mode with TUI
-    #[arg(long)]
+    #[arg(long, conflicts_with = "daemon")]
     pub proxy: bool,
 
     /// Enable auto-switching in proxy mode
@@ -16,7 +16,7 @@ pub struct Cli {
     pub auto_switch: bool,
 
     /// Run as background daemon (no TUI)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "proxy")]
     pub daemon: bool,
 }
 

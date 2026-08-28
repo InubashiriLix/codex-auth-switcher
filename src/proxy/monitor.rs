@@ -1,3 +1,4 @@
+use super::Router;
 use crate::{
     account::probe,
     config::{Config, ProxyConfig},
@@ -15,6 +16,7 @@ pub struct TokenMonitor {
     current_account: Arc<RwLock<Option<Uuid>>>,
     threshold: f64,
     check_interval: Duration,
+    router: Option<Router>,
 }
 
 impl TokenMonitor {
@@ -30,7 +32,13 @@ impl TokenMonitor {
             current_account,
             threshold: proxy_config.threshold,
             check_interval: Duration::from_secs(30), // 每30秒检查一次
+            router: None,
         }
+    }
+
+    pub fn with_router(mut self, router: Router) -> Self {
+        self.router = Some(router);
+        self
     }
 
     pub async fn start_monitoring(self: Arc<Self>) {
@@ -39,54 +47,59 @@ impl TokenMonitor {
         loop {
             interval.tick().await;
 
-            // 先获取current_id，然后释放锁
-            let current_id = *self.current_account.read();
+            // Probe every explicitly opted-in account. A stale quota probe is
+            // never allowed to enter the routing pool.
+            let account_data: Vec<_> = self
+                .accounts
+                .read()
+                .accounts
+                .iter()
+                .filter(|account| account.proxy_enabled)
+                .cloned()
+                .collect();
+            for mut account in account_data {
+                let id = account.id;
+                let config = self.config.clone();
+                let threshold = self.threshold;
 
-            if let Some(id) = current_id {
-                // 克隆账户数据（在锁外）
-                let account_data = {
-                    let accounts = self.accounts.read();
-                    accounts.accounts.iter().find(|a| a.id == id).cloned()
-                };
+                // 在后台线程中探测
+                let handle = tokio::task::spawn_blocking(move || {
+                    probe(&config, &mut account);
 
-                if let Some(mut account) = account_data {
-                    let config = self.config.clone();
-                    let threshold = self.threshold;
+                    // 检查是否需要切换
+                    let should_recommend = if let Some(quota) = &account.status.primary {
+                        quota.used_percent >= threshold
+                    } else {
+                        account.status.kind != StatusKind::Live
+                    };
 
-                    // 在后台线程中探测
-                    let handle = tokio::task::spawn_blocking(move || {
-                        probe(&config, &mut account);
+                    if should_recommend {
+                        info!(
+                            "Account {} usage: {:.1}% (threshold: {:.1}%)",
+                            account.label,
+                            account
+                                .status
+                                .primary
+                                .as_ref()
+                                .map(|q| q.used_percent)
+                                .unwrap_or(100.0),
+                            threshold
+                        );
+                    }
 
-                        // 检查是否需要切换
-                        let should_recommend = if let Some(quota) = &account.status.primary {
-                            quota.used_percent >= threshold
-                        } else {
-                            account.status.kind != StatusKind::Live
-                        };
+                    account
+                });
 
-                        if should_recommend {
-                            info!(
-                                "Account {} usage: {:.1}% (threshold: {:.1}%)",
-                                account.label,
-                                account
-                                    .status
-                                    .primary
-                                    .as_ref()
-                                    .map(|q| q.used_percent)
-                                    .unwrap_or(100.0),
-                                threshold
-                            );
-                        }
-
-                        account
-                    });
-
-                    // 等待探测完成并更新账户状态
-                    if let Ok(updated_account) = handle.await {
-                        let mut accounts = self.accounts.write();
-                        if let Some(acc) = accounts.accounts.iter_mut().find(|a| a.id == id) {
-                            *acc = updated_account;
-                        }
+                // 等待探测完成并更新账户状态
+                if let Ok(updated_account) = handle.await {
+                    if updated_account.status.kind == StatusKind::Live
+                        && let Some(router) = &self.router
+                    {
+                        router.close_circuit(id);
+                    }
+                    let mut accounts = self.accounts.write();
+                    if let Some(acc) = accounts.accounts.iter_mut().find(|a| a.id == id) {
+                        *acc = updated_account;
                     }
                 }
             }

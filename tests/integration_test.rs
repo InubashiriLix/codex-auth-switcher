@@ -1,9 +1,9 @@
-use codex_switcher::{
-    config::{Config, ProxyConfig, RecommendStrategy},
-    proxy::Recommender,
-    types::{Account, CheckStatus, StatusKind, Quota},
-};
 use chrono::Utc;
+use codex_switcher::{
+    config::{ProxyConfig, RecommendStrategy},
+    proxy::Recommender,
+    types::{Account, CheckStatus, Quota, StatusKind},
+};
 use uuid::Uuid;
 
 fn create_test_account(label: &str, used_percent: f64, status_kind: StatusKind) -> Account {
@@ -15,6 +15,8 @@ fn create_test_account(label: &str, used_percent: f64, status_kind: StatusKind) 
         email: Some(format!("{}@test.com", label)),
         plan: Some("test".to_string()),
         account_id: None,
+        tenant_id: "local".into(),
+        proxy_enabled: true,
         status: CheckStatus {
             kind: status_kind,
             detail: "test".to_string(),

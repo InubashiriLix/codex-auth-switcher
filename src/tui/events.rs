@@ -1,8 +1,5 @@
-use super::{draw, Modal, Ui, actions::*};
-use crate::{
-    error::Result,
-    paths::Paths,
-};
+use super::{Modal, Ui, UiTab, actions::*, draw};
+use crate::{error::Result, paths::Paths};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
@@ -13,7 +10,11 @@ use std::{
 
 const TICK_RATE: Duration = Duration::from_millis(100);
 
-pub fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, ui: &mut Ui, paths: &Paths) -> Result<()> {
+pub fn run_tui(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ui: &mut Ui,
+    paths: &Paths,
+) -> Result<()> {
     let mut last_tick = Instant::now();
 
     loop {
@@ -24,16 +25,18 @@ pub fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, ui: &mut U
 
         let timeout = TICK_RATE.saturating_sub(last_tick.elapsed());
 
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if handle_key(key, paths, ui)? {
-                    return Ok(());
-                }
-            }
+        if event::poll(timeout)?
+            && let Event::Key(key) = event::read()?
+            && handle_key(key, paths, ui)?
+        {
+            return Ok(());
         }
 
         if last_tick.elapsed() >= TICK_RATE {
             ui.tick += 1;
+            if ui.tick.is_multiple_of(10) {
+                refresh_control_snapshot(paths, ui);
+            }
             last_tick = Instant::now();
         }
     }
@@ -64,6 +67,10 @@ pub fn handle_key(key: KeyEvent, p: &Paths, ui: &mut Ui) -> Result<bool> {
     // 主界面按键处理
     let visible = ui.visible();
     match (key.modifiers, key.code) {
+        (KeyModifiers::SHIFT, KeyCode::BackTab) | (_, KeyCode::BackTab) => {
+            ui.tab = ui.tab.previous()
+        }
+        (_, KeyCode::Tab) => ui.tab = ui.tab.next(),
         (_, KeyCode::Char('q')) => return Ok(true),
         (_, KeyCode::Esc) => {
             ui.filter.clear();
@@ -131,7 +138,24 @@ pub fn handle_key(key: KeyEvent, p: &Paths, ui: &mut Ui) -> Result<bool> {
                 Err(e) => e.to_string(),
             };
         }
-        (_, KeyCode::Enter) => {
+        (_, KeyCode::Enter) if ui.tab == UiTab::Settings => {
+            let integration = crate::integration::CodexIntegration::new(&ui.config.codex_home);
+            ui.notice = match integration.status() {
+                Ok(crate::integration::IntegrationStatus::Enabled) => {
+                    ui.modal = Modal::ConfirmIntegrationDisable;
+                    "请确认停用 Codex 代理接入".into()
+                }
+                Ok(crate::integration::IntegrationStatus::Disabled) => {
+                    ui.modal = Modal::ConfirmIntegrationEnable;
+                    "请确认启用 Codex 代理接入".into()
+                }
+                Ok(crate::integration::IntegrationStatus::Drifted(diff)) => {
+                    format!("配置漂移，拒绝覆盖：{diff}")
+                }
+                Err(e) => e.to_string(),
+            };
+        }
+        (_, KeyCode::Enter) if ui.tab == UiTab::Accounts => {
             if let Some(i) = ui.selected_id() {
                 let account = &ui.index.accounts[i];
                 ui.notice = match activate_account(&ui.config, account) {
@@ -139,6 +163,9 @@ pub fn handle_key(key: KeyEvent, p: &Paths, ui: &mut Ui) -> Result<bool> {
                     Err(e) => e.to_string(),
                 };
             }
+        }
+        (_, KeyCode::Enter) => {
+            ui.notice = "当前页没有可展开的条目".into();
         }
         (_, KeyCode::Char('r')) => {
             if let Some(i) = ui.selected_id() {
@@ -150,6 +177,99 @@ pub fn handle_key(key: KeyEvent, p: &Paths, ui: &mut Ui) -> Result<bool> {
         (_, KeyCode::Char('R')) => {
             ui.notice = "正在检测全部账户…".into();
             start_probe(ui, ui.index.accounts.clone());
+        }
+        (_, KeyCode::Char(' ')) if ui.tab == UiTab::Accounts => {
+            if let Some(i) = ui.selected_id() {
+                ui.index.accounts[i].proxy_enabled = !ui.index.accounts[i].proxy_enabled;
+                ui.notice = match crate::account::save_index(p, &ui.index) {
+                    Ok(()) => {
+                        if ui.index.accounts[i].proxy_enabled {
+                            "账户已加入代理池".into()
+                        } else {
+                            "账户已移出代理池".into()
+                        }
+                    }
+                    Err(e) => e.to_string(),
+                };
+            }
+        }
+        (_, KeyCode::Char(' ')) if ui.tab == UiTab::Settings => {
+            ui.config.proxy.auto_switch = !ui.config.proxy.auto_switch;
+            ui.notice = match save_current_config(p, &ui.config) {
+                Ok(_) => {
+                    if ui.attached_daemon {
+                        let _ = tokio::runtime::Runtime::new().and_then(|runtime| {
+                            runtime
+                                .block_on(crate::daemon::control_request(
+                                    p,
+                                    hyper::Method::POST,
+                                    "/v1/daemon/reload",
+                                ))
+                                .map(|_| ())
+                                .map_err(|error| std::io::Error::other(error.to_string()))
+                        });
+                    }
+                    if ui.config.proxy.auto_switch {
+                        "已明确启用自动切换".into()
+                    } else {
+                        "已关闭自动切换".into()
+                    }
+                }
+                Err(error) => error.to_string(),
+            };
+        }
+        (_, KeyCode::Char('p')) => {
+            ui.notice = if ui.attached_daemon {
+                let endpoint = if ui.routing_paused {
+                    "/v1/proxy/resume"
+                } else {
+                    "/v1/proxy/pause"
+                };
+                match tokio::runtime::Runtime::new().and_then(|runtime| {
+                    runtime
+                        .block_on(crate::daemon::control_request(
+                            p,
+                            hyper::Method::POST,
+                            endpoint,
+                        ))
+                        .map_err(|error| std::io::Error::other(error.to_string()))
+                }) {
+                    Ok(_) => {
+                        ui.routing_paused = !ui.routing_paused;
+                        if ui.routing_paused {
+                            "路由已暂停".into()
+                        } else {
+                            "路由已恢复".into()
+                        }
+                    }
+                    Err(error) => format!("控制面请求失败：{error}"),
+                }
+            } else {
+                "当前没有已附着代理".into()
+            };
+        }
+        (_, KeyCode::Char('x')) if ui.tab == UiTab::Accounts => {
+            if let Some(i) = ui.selected_id() {
+                let account = &ui.index.accounts[i];
+                if ui.attached_daemon {
+                    let endpoint = format!("/v1/accounts/{}/switch", account.id);
+                    ui.notice = match tokio::runtime::Runtime::new().and_then(|runtime| {
+                        runtime
+                            .block_on(crate::daemon::control_request(
+                                p,
+                                hyper::Method::POST,
+                                &endpoint,
+                            ))
+                            .map_err(|error| std::io::Error::other(error.to_string()))
+                    }) {
+                        Ok(_) => format!("已在下一安全请求边界切换到 {}", account.label),
+                        Err(error) => format!("切换失败：{error}"),
+                    };
+                } else if let Some(proxy) = ui.proxy_state.as_ref() {
+                    proxy.stats.write().current_account = Some(account.id);
+                    ui.notice = format!("已在安全请求边界切换到 {}", account.label);
+                }
+            }
         }
         _ => {}
     }
@@ -178,14 +298,33 @@ fn handle_modal(key: KeyEvent, p: &Paths, ui: &mut Ui) -> Result<bool> {
             }
             ui.modal = Modal::None;
         }
+        KeyCode::Char('y')
+            if matches!(
+                ui.modal,
+                Modal::ConfirmIntegrationEnable | Modal::ConfirmIntegrationDisable
+            ) =>
+        {
+            let integration = crate::integration::CodexIntegration::new(&ui.config.codex_home);
+            let result = if ui.modal == Modal::ConfirmIntegrationEnable {
+                integration
+                    .enable()
+                    .map(|_| "已启用 Codex 代理接入；请重启 Codex".into())
+            } else {
+                integration
+                    .disable()
+                    .map(|_| "已停用 Codex 代理接入；请重启 Codex".into())
+            };
+            ui.notice = result.unwrap_or_else(|error| error.to_string());
+            ui.modal = Modal::None;
+        }
         KeyCode::Char('y') if ui.modal == Modal::ConfirmUseEmail => {
-            if let Some(i) = ui.selected_id() {
-                if let Some(email) = ui.index.accounts[i].email.clone() {
-                    ui.notice = match rename_account(&mut ui.index, p, i, email) {
-                        Ok(msg) => msg,
-                        Err(e) => e.to_string(),
-                    };
-                }
+            if let Some(i) = ui.selected_id()
+                && let Some(email) = ui.index.accounts[i].email.clone()
+            {
+                ui.notice = match rename_account(&mut ui.index, p, i, email) {
+                    Ok(msg) => msg,
+                    Err(e) => e.to_string(),
+                };
             }
             ui.modal = Modal::None;
         }
@@ -218,13 +357,18 @@ fn handle_modal(key: KeyEvent, p: &Paths, ui: &mut Ui) -> Result<bool> {
                     };
                 }
                 Modal::Rename => {
-                    if let Some(i) = ui.selected_id() {
-                        if !ui.input.trim().is_empty() {
-                            ui.notice = match rename_account(&mut ui.index, p, i, ui.input.trim().to_string()) {
-                                Ok(msg) => msg,
-                                Err(e) => e.to_string(),
-                            };
-                        }
+                    if let Some(i) = ui.selected_id()
+                        && !ui.input.trim().is_empty()
+                    {
+                        ui.notice = match rename_account(
+                            &mut ui.index,
+                            p,
+                            i,
+                            ui.input.trim().to_string(),
+                        ) {
+                            Ok(msg) => msg,
+                            Err(e) => e.to_string(),
+                        };
                     }
                 }
                 Modal::Settings => {
@@ -243,7 +387,12 @@ fn handle_modal(key: KeyEvent, p: &Paths, ui: &mut Ui) -> Result<bool> {
                     // TODO: 实现模式切换逻辑
                     ui.notice = "模式切换功能正在开发中".into();
                 }
-                Modal::Help | Modal::ConfirmUseEmail | Modal::ConfirmDelete | Modal::ProxySettings => {}
+                Modal::Help
+                | Modal::ConfirmUseEmail
+                | Modal::ConfirmDelete
+                | Modal::ConfirmIntegrationEnable
+                | Modal::ConfirmIntegrationDisable
+                | Modal::ProxySettings => {}
                 Modal::None => unreachable!(),
             }
             ui.modal = Modal::None;
@@ -255,7 +404,11 @@ fn handle_modal(key: KeyEvent, p: &Paths, ui: &mut Ui) -> Result<bool> {
         KeyCode::Char(c)
             if matches!(
                 ui.modal,
-                Modal::Import | Modal::Filter | Modal::Rename | Modal::Settings | Modal::ProxySettings
+                Modal::Import
+                    | Modal::Filter
+                    | Modal::Rename
+                    | Modal::Settings
+                    | Modal::ProxySettings
             ) =>
         {
             ui.input.push(c);

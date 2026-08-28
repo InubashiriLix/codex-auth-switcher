@@ -12,6 +12,8 @@ pub struct Config {
     pub mode: OperationMode,
     #[serde(default)]
     pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 impl Config {
@@ -30,13 +32,45 @@ impl Config {
             theme: Theme::default(),
             mode: OperationMode::Interactive,
             proxy: ProxyConfig::default(),
+            retention: RetentionConfig::default(),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    #[serde(default = "default_retention_days")]
+    pub days: i64,
+    #[serde(default = "default_max_requests")]
+    pub max_requests: usize,
+    #[serde(default = "default_max_events")]
+    pub max_events: usize,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            days: default_retention_days(),
+            max_requests: default_max_requests(),
+            max_events: default_max_events(),
+        }
+    }
+}
+
+fn default_retention_days() -> i64 {
+    7
+}
+fn default_max_requests() -> usize {
+    50_000
+}
+fn default_max_events() -> usize {
+    10_000
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OperationMode {
+    #[default]
     Interactive,
     ProxyDaemon {
         #[serde(default)]
@@ -48,12 +82,6 @@ pub enum OperationMode {
 
 fn default_true() -> bool {
     true
-}
-
-impl Default for OperationMode {
-    fn default() -> Self {
-        Self::Interactive
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,18 +116,13 @@ impl Default for ProxyConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecommendStrategy {
+    #[default]
     Smart,
     MaxRemaining,
     RoundRobin,
-}
-
-impl Default for RecommendStrategy {
-    fn default() -> Self {
-        Self::Smart
-    }
 }
 
 fn default_listen_addr() -> String {
@@ -164,6 +187,6 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
     }
-    fs::rename(temp, path)?;
+    crate::filesystem::atomic_replace(&temp, path)?;
     Ok(())
 }

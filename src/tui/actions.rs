@@ -1,6 +1,6 @@
 use crate::{
     account::{activate, import_current, import_file, import_value, probe, save_index},
-    config::{save_config, Config},
+    config::{Config, save_config},
     error::*,
     paths::Paths,
     types::{Account, AccountIndex},
@@ -54,10 +54,7 @@ pub fn import_from_json(
 }
 
 /// 激活账户
-pub fn activate_account(
-    config: &Config,
-    account: &Account,
-) -> Result<String> {
+pub fn activate_account(config: &Config, account: &Account) -> Result<String> {
     activate(config, account)?;
     Ok(format!("已激活账户: {}", account.label))
 }
@@ -134,10 +131,7 @@ pub fn probe_all_accounts(
 }
 
 /// 保存配置
-pub fn save_current_config(
-    paths: &Paths,
-    config: &Config,
-) -> Result<String> {
+pub fn save_current_config(paths: &Paths, config: &Config) -> Result<String> {
     save_config(paths, config)?;
     Ok("配置已保存".into())
 }
@@ -159,7 +153,10 @@ pub fn start_probe(ui: &mut Ui, accounts: Vec<Account>) {
                 break;
             }
             probe(&config, &mut account);
-            if sender.send(ProbeEvent::Completed(account)).is_err() {
+            if sender
+                .send(ProbeEvent::Completed(Box::new(account)))
+                .is_err()
+            {
                 break;
             }
         }
@@ -187,6 +184,7 @@ pub fn poll_probe(paths: &Paths, ui: &mut Ui) -> Result<()> {
                     checking.current = label;
                 }
                 ProbeEvent::Completed(account) => {
+                    let account = *account;
                     if let Some(pos) = ui.index.accounts.iter().position(|a| a.id == account.id) {
                         ui.index.accounts[pos] = account;
                     }
@@ -207,4 +205,60 @@ pub fn poll_probe(paths: &Paths, ui: &mut Ui) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Refresh the attached daemon snapshot without ever importing credentials.
+pub fn refresh_control_snapshot(paths: &Paths, ui: &mut Ui) {
+    if !ui.attached_daemon {
+        return;
+    }
+    let snapshot = tokio::runtime::Runtime::new().ok().and_then(|runtime| {
+        runtime
+            .block_on(crate::daemon::control_request(
+                paths,
+                hyper::Method::GET,
+                "/v1/snapshot",
+            ))
+            .ok()
+    });
+    let Some(snapshot) = snapshot else {
+        ui.attached_daemon = false;
+        ui.notice = "daemon 控制面连接已断开".into();
+        return;
+    };
+    if ui.checking.is_none()
+        && let Some(accounts) = snapshot
+            .get("accounts")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+    {
+        ui.index.accounts = accounts;
+    }
+    let proxy = ui
+        .proxy_state
+        .get_or_insert_with(crate::proxy::ProxyState::new);
+    if let Some(running) = snapshot
+        .pointer("/proxy/running")
+        .and_then(serde_json::Value::as_bool)
+    {
+        proxy
+            .running
+            .store(running, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(stats) = snapshot
+        .get("stats")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+    {
+        *proxy.stats.write() = stats;
+    }
+    ui.routing_paused = snapshot
+        .get("routing_paused")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    ui.active_requests = snapshot
+        .get("active_requests")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 }

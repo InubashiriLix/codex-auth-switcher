@@ -16,6 +16,16 @@ pub struct Account {
     pub account_id: Option<String>,
     #[serde(default)]
     pub status: CheckStatus,
+    /// Reserved for the remote/multi-tenant protocol. Version one only uses `local`.
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: String,
+    /// Accounts are opt-in for proxy routing after upgrading an old index.
+    #[serde(default)]
+    pub proxy_enabled: bool,
+}
+
+fn default_tenant_id() -> String {
+    "local".into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

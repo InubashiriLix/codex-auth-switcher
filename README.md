@@ -17,8 +17,6 @@ Codex Switcher lets you keep several **your own** Codex CLI logins locally, insp
 - 📊 **Statistics**: Track requests, failures, auto-switches
 - 🔧 **Systemd ready**: Run as a system service
 
-See [PROXY_MODE.md](PROXY_MODE.md) for full documentation.
-
 ## Why it is useful
 
 - **One keyboard-driven workflow** — import, inspect, rename, test, and activate accounts without leaving the terminal.
@@ -27,7 +25,7 @@ See [PROXY_MODE.md](PROXY_MODE.md) for full documentation.
 - **Readable anywhere** — four built-in themes, including a high-contrast light theme; press `t` to switch instantly.
 - **No credential service** — tokens are not uploaded, logged, or displayed by this tool.
 
-> This project is for accounts you are authorized to use. It does not bypass limits, rotate accounts automatically, or provide shared credentials.
+> This project is for accounts you are authorized to use. It does not bypass limits or provide shared credentials. Accounts never join the proxy pool until you explicitly opt them in.
 
 ## Screenshots
 
@@ -66,11 +64,15 @@ For a checkout-only run / 仅试运行：`cargo run --release`。
 
 ### 🆕 Proxy Mode / 代理模式
 ```bash
-# Start daemon
+# TUI + embedded proxy (or attach to an existing project daemon)
+codex-switcher --proxy
+
+# Or start a headless daemon
 codex-switcher --daemon
 
-# Configure Codex CLI to use the proxy
-export HTTPS_PROXY=http://127.0.0.1:8765
+# In the TUI: Settings → Enter to enable Codex integration.
+# This safely writes a model_provider to $CODEX_HOME/config.toml.
+# Restart Codex after enabling or disabling it; HTTPS_PROXY is not used.
 
 # Check status
 codex-switcher daemon-status
@@ -89,14 +91,15 @@ systemctl --user enable codex-switcher.service
 systemctl --user start codex-switcher.service
 ```
 
-See [PROXY_MODE.md](PROXY_MODE.md) for detailed proxy mode documentation.
-
 Snapshots live under `$XDG_DATA_HOME/codex-switcher/` (fallback `~/.local/share/codex-switcher/`). Configuration lives under `$XDG_CONFIG_HOME/codex-switcher/config.toml` (fallback `~/.config/codex-switcher/`). Press `s` to change the Codex home directory.
 
 ## Keymap / 快捷键
 
 | Key | Action |
 | --- | --- |
+| `Tab` / `Shift-Tab` | Switch Overview, Instances, Account Pool, Events, Settings |
+| `Space` | Add/remove selected account from the proxy pool |
+| `p` / `x` | Pause routing / manually switch at a safe request boundary |
 | `a` / `i` | Import current auth / JSON or path · 导入认证 |
 | `r` / `R` | Check selected / all accounts · 检测额度 |
 | `Enter` | Activate selected snapshot · 启用账户 |
@@ -113,7 +116,7 @@ Checks run in the background with a progress indicator. When an email has been d
 
 ## Security / 安全
 
-Snapshots use private permissions and atomic replacement. Symlinked auth files are rejected, and switching or saving is blocked while a `codex` process owned by the current user is running. Use only accounts and credentials you are authorized to manage. 请勿提交 token、邮箱、路径或真实账户快照。
+Snapshots and daemon runtime descriptors use private permissions and atomic replacement. The data plane and authenticated control plane bind only to loopback in this release. Monitoring stores metadata summaries in SQLite WAL, never prompts, code, model output, request/response bodies, authorization headers, or tokens. Traditional snapshot activation is blocked while Codex is running; proxy routing changes only at a request boundary and never migrates an SSE stream. Use only accounts and credentials you are authorized to manage. 请勿提交 token、邮箱、路径或真实账户快照。
 
 ## Contributing / 参与贡献
 

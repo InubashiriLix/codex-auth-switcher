@@ -1,4 +1,7 @@
-use crate::{config::RecommendStrategy, types::{Account, StatusKind}};
+use crate::{
+    config::RecommendStrategy,
+    types::{Account, StatusKind},
+};
 use chrono::Utc;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -18,10 +21,24 @@ impl Recommender {
     }
 
     pub fn recommend(&self, accounts: &[Account], threshold: f64) -> Option<Uuid> {
+        let eligible: Vec<Account> = accounts
+            .iter()
+            .filter(|account| account.proxy_enabled && account.status.kind == StatusKind::Live)
+            .filter(|account| {
+                [
+                    account.status.primary.as_ref(),
+                    account.status.secondary.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|quota| quota.used_percent < threshold)
+            })
+            .cloned()
+            .collect();
         match self.strategy {
-            RecommendStrategy::Smart => self.smart_recommend(accounts, threshold),
-            RecommendStrategy::MaxRemaining => self.max_remaining(accounts),
-            RecommendStrategy::RoundRobin => self.round_robin(accounts),
+            RecommendStrategy::Smart => self.smart_recommend(&eligible, threshold),
+            RecommendStrategy::MaxRemaining => self.max_remaining(&eligible),
+            RecommendStrategy::RoundRobin => self.round_robin(&eligible),
         }
     }
 
@@ -42,8 +59,10 @@ impl Recommender {
                     .status
                     .primary
                     .as_ref()
+                    .into_iter()
+                    .chain(a.status.secondary.as_ref())
                     .map(|q| 100.0 - q.used_percent)
-                    .unwrap_or(0.0);
+                    .fold(0.0, f64::max);
 
                 let reset_bonus = a
                     .status
@@ -75,7 +94,10 @@ impl Recommender {
                 a.status
                     .primary
                     .as_ref()
+                    .into_iter()
+                    .chain(a.status.secondary.as_ref())
                     .map(|q| ((100.0 - q.used_percent) * 100.0) as i64)
+                    .max()
                     .unwrap_or(0)
             })
             .map(|a| a.id)
@@ -94,18 +116,18 @@ impl Recommender {
         let mut last_used = self.last_used.lock();
 
         // 找到上次使用的账户
-        if let Some(last_id) = last_used.last() {
-            if let Some(pos) = available.iter().position(|a| &a.id == last_id) {
-                // 返回下一个
-                let next_idx = (pos + 1) % available.len();
-                let next_id = available[next_idx].id;
-                last_used.push(next_id);
-                // 只保留最近10个记录
-                if last_used.len() > 10 {
-                    last_used.remove(0);
-                }
-                return Some(next_id);
+        if let Some(last_id) = last_used.last()
+            && let Some(pos) = available.iter().position(|a| &a.id == last_id)
+        {
+            // 返回下一个
+            let next_idx = (pos + 1) % available.len();
+            let next_id = available[next_idx].id;
+            last_used.push(next_id);
+            // 只保留最近10个记录
+            if last_used.len() > 10 {
+                last_used.remove(0);
             }
+            return Some(next_id);
         }
 
         // 如果没有历史记录，返回第一个
@@ -130,6 +152,8 @@ mod tests {
             email: None,
             plan: None,
             account_id: None,
+            tenant_id: "local".into(),
+            proxy_enabled: true,
             status: CheckStatus {
                 kind: StatusKind::Live,
                 checked_at: Some(Utc::now()),

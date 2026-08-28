@@ -1,34 +1,47 @@
-mod hot_reload;
 mod control;
+mod control_api;
+mod hot_reload;
 mod notifications;
 
+pub use control::{
+    check_daemon_status, remove_pid_file, send_reload_signal, send_stop_signal, write_pid_file,
+};
+pub use control_api::{
+    ControlContext, ControlServer, RuntimeDescriptor, control_request, read_runtime,
+};
 pub use hot_reload::{HotReloader, ReloadEvent};
-pub use control::{check_daemon_status, send_reload_signal, send_stop_signal, write_pid_file, remove_pid_file};
 pub use notifications::NotificationManager;
 
 use crate::{
     account::load_index,
-    config::{load_config, Config},
+    config::{Config, load_config},
     error::*,
     paths::Paths,
-    proxy::{AccountSwitcher, ProxyServer, ProxyState, Recommender, SwitchDecision, TokenMonitor},
+    proxy::{ProxyServer, ProxyState, Recommender, TokenMonitor},
+    storage::{MetadataStore, RetentionPolicy, RuntimeEvent},
     types::{AccountIndex, StatusKind},
 };
 use chrono::Utc;
 use parking_lot::RwLock;
 use std::{
     fs,
-    pin::Pin,
     future::Future,
-    sync::{
-        atomic::Ordering,
-        Arc,
-    },
+    pin::Pin,
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
-use tokio::signal::unix::{signal, SignalKind};
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+struct PidFileCleanup(std::path::PathBuf);
+
+impl Drop for PidFileCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
 
 pub struct DaemonState {
     pub config: Config,
@@ -39,14 +52,11 @@ pub struct DaemonState {
     pub hot_reloader: HotReloader,
     pub recommender: Recommender,
     pub paths: Paths,
+    pub metadata_store: Arc<MetadataStore>,
 }
 
 impl DaemonState {
-    pub fn new(
-        config: Config,
-        index: AccountIndex,
-        paths: Paths,
-    ) -> Result<Self> {
+    pub fn new(config: Config, index: AccountIndex, paths: Paths) -> Result<Self> {
         let accounts = Arc::new(RwLock::new(index));
         let current_account = Arc::new(RwLock::new(Self::find_active_account(&config, &accounts)));
         let proxy_state = ProxyState::new();
@@ -66,6 +76,15 @@ impl DaemonState {
 
         let recommender = Recommender::new(config.proxy.strategy.clone());
         let hot_reloader = HotReloader::new(&paths)?;
+        let metadata_store = Arc::new(MetadataStore::open(
+            &paths.database_file,
+            RetentionPolicy {
+                days: config.retention.days,
+                max_requests: config.retention.max_requests,
+                max_events: config.retention.max_events,
+            },
+        )?);
+        proxy_server.attach_metadata_store(metadata_store.clone());
 
         Ok(Self {
             config,
@@ -76,6 +95,7 @@ impl DaemonState {
             hot_reloader,
             recommender,
             paths,
+            metadata_store,
         })
     }
 
@@ -157,7 +177,10 @@ impl DaemonState {
         }
 
         // 找到第一个可用账户
-        if let Some(account) = index.accounts.iter().find(|a| a.status.kind == StatusKind::Live)
+        if let Some(account) = index
+            .accounts
+            .iter()
+            .find(|a| a.status.kind == StatusKind::Live)
         {
             *self.current_account.write() = Some(account.id);
             self.proxy_state.stats.write().current_account = Some(account.id);
@@ -230,9 +253,48 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
     let mut state = DaemonState::new(config.clone(), index, paths.clone())?;
 
     state.proxy_state.running.store(true, Ordering::Relaxed);
+    let _ = state.metadata_store.record_event(&RuntimeEvent {
+        id: Uuid::new_v4().to_string(),
+        occurred_at: Utc::now(),
+        tenant_id: "local".into(),
+        device_id: std::env::var("HOSTNAME").unwrap_or_else(|_| "local-device".into()),
+        client_instance_id: None,
+        kind: "daemon_started".into(),
+        account_id: None,
+        detail: "代理守护进程已启动".into(),
+    });
 
     // 写入PID文件
     write_pid_file(&paths)?;
+    let _pid_file_cleanup = PidFileCleanup(paths.pid_file.clone());
+
+    // Cross-platform, authenticated control plane. The descriptor is private
+    // and contains a random 256-bit bearer token.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let control = ControlServer::bind(ControlContext {
+        config: Arc::new(RwLock::new(state.config.clone())),
+        accounts: state.accounts.clone(),
+        current_account: state.current_account.clone(),
+        proxy_server: state.proxy_server.clone(),
+        proxy_state: state.proxy_state.clone(),
+        paths: paths.clone(),
+        shutdown: shutdown_tx.clone(),
+        metadata_store: state.metadata_store.clone(),
+    })
+    .await?;
+    let control_handle = tokio::spawn(async move {
+        if let Err(error) = control.serve().await {
+            error!(%error, "control server exited");
+        }
+    });
+    let cleanup_store = state.metadata_store.clone();
+    let _cleanup_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            let _ = cleanup_store.cleanup();
+        }
+    });
 
     // 启动代理服务器
     let proxy_handle = {
@@ -249,10 +311,10 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
         let mut state_clone = state.clone();
         tokio::spawn(async move {
             loop {
-                if let Some(event) = state_clone.hot_reloader.poll() {
-                    if let Err(e) = state_clone.handle_reload(event).await {
-                        error!("Hot reload failed: {}", e);
-                    }
+                if let Some(event) = state_clone.hot_reloader.poll()
+                    && let Err(e) = state_clone.handle_reload(event).await
+                {
+                    error!("Hot reload failed: {}", e);
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -261,50 +323,19 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
 
     // 启动Token监控
     let _monitor_handle = {
-        let monitor = Arc::new(TokenMonitor::new(
-            state.config.clone(),
-            state.accounts.clone(),
-            state.current_account.clone(),
-            &state.config.proxy,
-        ));
+        let monitor = Arc::new(
+            TokenMonitor::new(
+                state.config.clone(),
+                state.accounts.clone(),
+                state.current_account.clone(),
+                &state.config.proxy,
+            )
+            .with_router(state.proxy_server.router().clone()),
+        );
         tokio::spawn(async move {
             monitor.start_monitoring().await;
         })
     };
-
-    // 启动自动切换检测（如果启用）
-    if state.config.proxy.auto_switch {
-        let _switch_handle = {
-            let switcher = Arc::new(AccountSwitcher::new(
-                state.config.proxy.clone(),
-                Recommender::new(state.config.proxy.strategy.clone()),
-            ));
-            let mut state_clone = state.clone();
-
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-                loop {
-                    interval.tick().await;
-
-                    match switcher.check_and_switch(&state_clone) {
-                        Ok(SwitchDecision::Switch { target, reason }) => {
-                            info!("自动切换触发: {} → {}", reason, target);
-                            if let Err(e) = switcher.execute_switch(&mut state_clone, target).await {
-                                error!("自动切换失败: {}", e);
-                            }
-                        }
-                        Ok(SwitchDecision::Wait { reason }) => {
-                            info!("切换等待: {}", reason);
-                        }
-                        Ok(SwitchDecision::NoAction) => {}
-                        Err(e) => {
-                            error!("切换检测失败: {}", e);
-                        }
-                    }
-                }
-            })
-        };
-    }
 
     // 通知systemd服务已就绪
     #[cfg(unix)]
@@ -313,43 +344,58 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
     }
     info!("Daemon started and ready");
 
-    // 处理信号
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sighup = signal(SignalKind::hangup())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
+    // 处理信号。控制 API 是跨平台主入口，Unix 信号仅保留兼容。
+    #[cfg(unix)]
+    {
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sighup = signal(SignalKind::hangup())?;
+        let mut sigint = signal(SignalKind::interrupt())?;
 
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                info!("Received authenticated control shutdown");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, shutting down gracefully");
+            }
+            _ = sigint.recv() => {
+                info!("Received SIGINT, shutting down gracefully");
+            }
+            _ = sighup.recv() => {
+                info!("Received SIGHUP, reloading configuration");
+                #[cfg(unix)]
+                {
+                    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Reloading]);
+                }
+                if let Err(e) = force_reload_all(&mut state).await {
+                    error!("Force reload failed: {}", e);
+                }
+                #[cfg(unix)]
+                {
+                    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+                }
+                // 克隆数据，释放锁
+                let accounts_clone = state.accounts.read().clone();
+                // 继续运行，重新调用
+                return Box::pin(run_daemon_impl(state.config, accounts_clone, state.paths)).await;
+            }
+            result = proxy_handle => {
+                error!("Proxy server exited unexpectedly: {:?}", result);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
     tokio::select! {
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM, shutting down gracefully");
-        }
-        _ = sigint.recv() => {
-            info!("Received SIGINT, shutting down gracefully");
-        }
-        _ = sighup.recv() => {
-            info!("Received SIGHUP, reloading configuration");
-            #[cfg(unix)]
-            {
-                let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Reloading]);
-            }
-            if let Err(e) = force_reload_all(&mut state).await {
-                error!("Force reload failed: {}", e);
-            }
-            #[cfg(unix)]
-            {
-                let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
-            }
-            // 克隆数据，释放锁
-            let accounts_clone = state.accounts.read().clone();
-            // 继续运行，重新调用
-            return Box::pin(run_daemon_impl(state.config, accounts_clone, state.paths)).await;
-        }
-        result = proxy_handle => {
-            error!("Proxy server exited unexpectedly: {:?}", result);
-        }
+        _ = shutdown_rx.changed() => info!("Received authenticated control shutdown"),
+        _ = tokio::signal::ctrl_c() => info!("Received Ctrl+C, shutting down gracefully"),
+        result = proxy_handle => error!("Proxy server exited unexpectedly: {:?}", result),
     }
 
     // 优雅关闭
     shutdown_gracefully(&state).await?;
+    let _ = shutdown_tx.send(true);
+    let _ = control_handle.await;
 
     // 清理PID文件
     remove_pid_file(&paths)?;
@@ -406,6 +452,7 @@ impl Clone for DaemonState {
             hot_reloader: self.hot_reloader.clone(),
             recommender: Recommender::new(self.config.proxy.strategy.clone()),
             paths: self.paths.clone(),
+            metadata_store: self.metadata_store.clone(),
         }
     }
 }

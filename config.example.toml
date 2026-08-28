@@ -48,9 +48,14 @@ cooldown_seconds = 5
 # - "round_robin": 轮询所有可用账户
 strategy = "smart"
 
-# ChatGPT API基础URL
-# 通常不需要修改，除非使用自定义endpoint
+# ChatGPT API基础URL（生产环境保持默认；测试可使用回环地址）
 target_base = "https://chatgpt.com"
+
+# 元数据历史保留；正文和认证信息从不写入数据库
+[retention]
+days = 7
+max_requests = 50000
+max_events = 10000
 
 # 高级配置示例 / Advanced Configuration Examples
 

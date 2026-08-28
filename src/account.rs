@@ -4,10 +4,10 @@ use crate::{
     paths::Paths,
     types::{Account, AccountIndex, CheckStatus, Quota, StatusKind},
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use reqwest::{blocking::Client, header::*};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{env, fs, path::Path, time::Duration};
 use uuid::Uuid;
 
@@ -30,15 +30,15 @@ pub fn snapshot_path(config: &Config, id: Uuid) -> std::path::PathBuf {
     config.accounts_dir.join(format!("{id}.auth.json"))
 }
 
-pub fn auth_tokens(
-    v: &Value,
-) -> Result<(
+pub type AuthTokens = (
     Value,
     String,
     Option<String>,
     Option<String>,
     Option<String>,
-)> {
+);
+
+pub fn auth_tokens(v: &Value) -> Result<AuthTokens> {
     let tokens = v.get("tokens").cloned();
     let access = tokens
         .as_ref()
@@ -177,6 +177,8 @@ pub fn import_value(
         plan,
         account_id,
         status: CheckStatus::default(),
+        tenant_id: "local".into(),
+        proxy_enabled: false,
     });
     Ok(())
 }
@@ -408,6 +410,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
     }
-    fs::rename(temp, path)?;
+    crate::filesystem::atomic_replace(&temp, path)?;
     Ok(())
 }
