@@ -7,7 +7,9 @@ pub use control::{
     check_daemon_status, remove_pid_file, send_reload_signal, send_stop_signal, write_pid_file,
 };
 pub use control_api::{
-    ControlContext, ControlServer, RuntimeDescriptor, control_request, read_runtime,
+    AccountRuntimeSnapshot, Alert, ControlContext, ControlServer, ControlSnapshot, HealthSnapshot,
+    InstanceSummary, ProxySnapshot, RuntimeDescriptor, control_request, control_request_json,
+    control_stream, read_runtime,
 };
 pub use hot_reload::{HotReloader, ReloadEvent};
 pub use notifications::NotificationManager;
@@ -17,19 +19,13 @@ use crate::{
     config::{Config, load_config},
     error::*,
     paths::Paths,
-    proxy::{ProxyServer, ProxyState, Recommender, TokenMonitor},
+    proxy::{ProxyRuntime, ProxyServer, ProxyState, Recommender, TokenMonitor},
     storage::{MetadataStore, RetentionPolicy, RuntimeEvent},
     types::{AccountIndex, StatusKind},
 };
 use chrono::Utc;
 use parking_lot::RwLock;
-use std::{
-    fs,
-    future::Future,
-    pin::Pin,
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
-};
+use std::{fs, future::Future, pin::Pin, sync::Arc, time::Duration};
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
@@ -49,6 +45,7 @@ pub struct DaemonState {
     pub current_account: Arc<RwLock<Option<Uuid>>>,
     pub proxy_server: Arc<ProxyServer>,
     pub proxy_state: ProxyState,
+    pub proxy_runtime: ProxyRuntime,
     pub hot_reloader: HotReloader,
     pub recommender: Recommender,
     pub paths: Paths,
@@ -73,6 +70,7 @@ impl DaemonState {
             current_account.clone(),
             proxy_state.stats.clone(),
         ));
+        let proxy_runtime = ProxyRuntime::new(proxy_server.clone(), proxy_state.clone());
 
         let recommender = Recommender::new(config.proxy.strategy.clone());
         let hot_reloader = HotReloader::new(&paths)?;
@@ -92,6 +90,7 @@ impl DaemonState {
             current_account,
             proxy_server,
             proxy_state,
+            proxy_runtime,
             hot_reloader,
             recommender,
             paths,
@@ -252,7 +251,6 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
     // 初始化守护进程状态
     let mut state = DaemonState::new(config.clone(), index, paths.clone())?;
 
-    state.proxy_state.running.store(true, Ordering::Relaxed);
     let _ = state.metadata_store.record_event(&RuntimeEvent {
         id: Uuid::new_v4().to_string(),
         occurred_at: Utc::now(),
@@ -277,6 +275,7 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
         current_account: state.current_account.clone(),
         proxy_server: state.proxy_server.clone(),
         proxy_state: state.proxy_state.clone(),
+        proxy_runtime: state.proxy_runtime.clone(),
         paths: paths.clone(),
         shutdown: shutdown_tx.clone(),
         metadata_store: state.metadata_store.clone(),
@@ -296,15 +295,15 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
         }
     });
 
-    // 启动代理服务器
-    let proxy_handle = {
-        let proxy = state.proxy_server.clone();
-        tokio::spawn(async move {
-            if let Err(e) = proxy.serve().await {
-                error!("Proxy server error: {}", e);
-            }
-        })
-    };
+    if state.config.proxy.enabled {
+        if has_eligible_proxy_account(&state.accounts.read(), state.config.proxy.threshold) {
+            state.proxy_runtime.start();
+        } else {
+            state
+                .proxy_runtime
+                .mark_blocked("没有已入池且健康的账户，数据代理未启动");
+        }
+    }
 
     // 启动热重载监控
     let _reload_handle = {
@@ -379,9 +378,6 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
                 // 继续运行，重新调用
                 return Box::pin(run_daemon_impl(state.config, accounts_clone, state.paths)).await;
             }
-            result = proxy_handle => {
-                error!("Proxy server exited unexpectedly: {:?}", result);
-            }
         }
     }
 
@@ -389,7 +385,6 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
     tokio::select! {
         _ = shutdown_rx.changed() => info!("Received authenticated control shutdown"),
         _ = tokio::signal::ctrl_c() => info!("Received Ctrl+C, shutting down gracefully"),
-        result = proxy_handle => error!("Proxy server exited unexpectedly: {:?}", result),
     }
 
     // 优雅关闭
@@ -410,13 +405,7 @@ async fn shutdown_gracefully(state: &DaemonState) -> Result<()> {
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
     }
 
-    state.proxy_state.running.store(false, Ordering::Relaxed);
-    state.proxy_server.stop_accepting().await;
-
-    let drained = state
-        .proxy_server
-        .connection_tracker()
-        .wait_for_drain(Duration::from_secs(30));
+    let drained = state.proxy_runtime.stop(Duration::from_secs(30)).await;
 
     if !drained {
         warn!(
@@ -449,10 +438,26 @@ impl Clone for DaemonState {
             current_account: self.current_account.clone(),
             proxy_server: self.proxy_server.clone(),
             proxy_state: self.proxy_state.clone(),
+            proxy_runtime: self.proxy_runtime.clone(),
             hot_reloader: self.hot_reloader.clone(),
             recommender: Recommender::new(self.config.proxy.strategy.clone()),
             paths: self.paths.clone(),
             metadata_store: self.metadata_store.clone(),
         }
     }
+}
+
+fn has_eligible_proxy_account(index: &AccountIndex, threshold: f64) -> bool {
+    index.accounts.iter().any(|account| {
+        account.proxy_enabled
+            && account.status.kind == StatusKind::Live
+            && account.status.checked_at.is_some_and(|checked| {
+                Utc::now().signed_duration_since(checked).num_seconds() <= 90
+            })
+            && account
+                .status
+                .primary
+                .as_ref()
+                .is_some_and(|quota| quota.used_percent < threshold)
+    })
 }

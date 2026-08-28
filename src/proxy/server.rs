@@ -190,6 +190,28 @@ impl ProxyServer {
         Ok(())
     }
 
+    pub fn start_accepting(&self) {
+        self.accepting.store(true, Ordering::Relaxed);
+    }
+
+    fn record_event(&self, kind: &str, account_id: Option<Uuid>, detail: &str) {
+        let Some(store) = self.metadata_store.read().clone() else {
+            return;
+        };
+        let _ = store.record_event(&crate::storage::RuntimeEvent {
+            id: Uuid::new_v4().to_string(),
+            occurred_at: Utc::now(),
+            tenant_id: "local".into(),
+            device_id: std::env::var("HOSTNAME")
+                .or_else(|_| std::env::var("COMPUTERNAME"))
+                .unwrap_or_else(|_| "local-device".into()),
+            client_instance_id: None,
+            kind: kind.into(),
+            account_id,
+            detail: detail.into(),
+        });
+    }
+
     async fn handle_request(
         &self,
         request: Request<Incoming>,
@@ -388,7 +410,7 @@ impl ProxyServer {
                 let until = (reason == CircuitReason::RateLimited)
                     .then(|| self.account_reset(failed_id))
                     .flatten();
-                self.router.open_circuit(failed_id, reason, until);
+                self.router.open_circuit(failed_id, reason.clone(), until);
                 let alternative_route = {
                     let accounts = self.accounts.read();
                     self.router.route(&accounts, &sticky_key)
@@ -409,6 +431,14 @@ impl ProxyServer {
                             .await?;
                         *self.current_account.write() = Some(route.account_id);
                         self.stats.write().current_account = Some(route.account_id);
+                        self.record_event(
+                            "auto_switch",
+                            Some(route.account_id),
+                            &format!(
+                                "账户 {} 因 {:?} 被隔离，切换到 {}",
+                                failed_id, reason, route.account_id
+                            ),
+                        );
                         retries += 1;
                     }
                     Ok(_) => {}

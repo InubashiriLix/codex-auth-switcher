@@ -5,9 +5,15 @@ use crate::{
     paths::Paths,
     types::{Account, AccountIndex},
 };
-use std::{path::Path, sync::mpsc, thread};
+use futures_util::StreamExt;
+use std::{
+    path::Path,
+    sync::{Arc, atomic::Ordering, mpsc},
+    thread,
+    time::Duration,
+};
 
-use super::{Checking, ProbeEvent, Ui};
+use super::{ActionUpdate, Checking, ControlUpdate, ProbeEvent, Ui};
 
 /// 导入当前Codex认证
 pub fn import_current_auth(
@@ -207,58 +213,165 @@ pub fn poll_probe(paths: &Paths, ui: &mut Ui) -> Result<()> {
     Ok(())
 }
 
-/// Refresh the attached daemon snapshot without ever importing credentials.
-pub fn refresh_control_snapshot(paths: &Paths, ui: &mut Ui) {
-    if !ui.attached_daemon {
+pub fn start_control_watcher(paths: &Paths, ui: &mut Ui) {
+    if ui.control_updates.is_some() {
         return;
     }
-    let snapshot = tokio::runtime::Runtime::new().ok().and_then(|runtime| {
-        runtime
-            .block_on(crate::daemon::control_request(
-                paths,
-                hyper::Method::GET,
-                "/v1/snapshot",
-            ))
-            .ok()
+    let (sender, receiver) = mpsc::channel();
+    let paths = paths.clone();
+    let stop = Arc::clone(&ui.control_stop);
+    thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Runtime::new() else {
+            return;
+        };
+        runtime.block_on(async move {
+            while !stop.load(Ordering::Relaxed) {
+                match crate::daemon::control_stream(&paths).await {
+                    Ok(response) => {
+                        let mut stream = response.bytes_stream();
+                        while !stop.load(Ordering::Relaxed) {
+                            match tokio::time::timeout(Duration::from_secs(3), stream.next()).await
+                            {
+                                Ok(Some(Ok(_))) => {
+                                    if sender.send(fetch_control_update(&paths).await).is_err() {
+                                        return;
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if sender.send(fetch_control_update(&paths).await).is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        });
     });
-    let Some(snapshot) = snapshot else {
-        ui.attached_daemon = false;
-        ui.notice = "daemon 控制面连接已断开".into();
-        return;
-    };
-    if ui.checking.is_none()
-        && let Some(accounts) = snapshot
-            .get("accounts")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-    {
-        ui.index.accounts = accounts;
-    }
-    let proxy = ui
-        .proxy_state
-        .get_or_insert_with(crate::proxy::ProxyState::new);
-    if let Some(running) = snapshot
-        .pointer("/proxy/running")
-        .and_then(serde_json::Value::as_bool)
-    {
-        proxy
-            .running
-            .store(running, std::sync::atomic::Ordering::Relaxed);
-    }
-    if let Some(stats) = snapshot
-        .get("stats")
-        .cloned()
+    ui.control_updates = Some(receiver);
+}
+
+async fn fetch_control_update(paths: &Paths) -> ControlUpdate {
+    let snapshot = crate::daemon::control_request(paths, hyper::Method::GET, "/v1/snapshot")
+        .await
+        .ok()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let events = crate::daemon::control_request(paths, hyper::Method::GET, "/v1/events")
+        .await
+        .ok()
+        .and_then(|value| value.get("items").cloned())
         .and_then(|value| serde_json::from_value(value).ok())
-    {
-        *proxy.stats.write() = stats;
-    }
-    ui.routing_paused = snapshot
-        .get("routing_paused")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    ui.active_requests = snapshot
-        .get("active_requests")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
         .unwrap_or_default();
+    let requests = crate::daemon::control_request(paths, hyper::Method::GET, "/v1/requests")
+        .await
+        .ok()
+        .and_then(|value| value.get("items").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+    let metrics = crate::daemon::control_request(
+        paths,
+        hyper::Method::GET,
+        "/v1/metrics?window=300&bucket=10",
+    )
+    .await
+    .ok()
+    .and_then(|value| serde_json::from_value(value).ok())
+    .unwrap_or_default();
+    let metrics_1m =
+        crate::daemon::control_request(paths, hyper::Method::GET, "/v1/metrics?window=60&bucket=5")
+            .await
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
+    snapshot.map_or(ControlUpdate::Disconnected, |snapshot| {
+        ControlUpdate::Connected {
+            snapshot: Box::new(snapshot),
+            events,
+            requests,
+            metrics: Box::new(metrics),
+            metrics_1m: Box::new(metrics_1m),
+        }
+    })
+}
+
+pub fn poll_control_updates(ui: &mut Ui) {
+    let mut updates = Vec::new();
+    if let Some(receiver) = &ui.control_updates {
+        while let Ok(update) = receiver.try_recv() {
+            updates.push(update);
+        }
+    }
+    for update in updates {
+        match update {
+            ControlUpdate::Connected {
+                snapshot,
+                events,
+                requests,
+                metrics,
+                metrics_1m,
+            } => {
+                let snapshot = *snapshot;
+                let metrics = *metrics;
+                let metrics_1m = *metrics_1m;
+                ui.attached_daemon = true;
+                if ui.checking.is_none() {
+                    ui.index.accounts.clone_from(&snapshot.accounts);
+                }
+                let total_requests = snapshot.stats.total_requests;
+                let failures = snapshot.stats.failed_requests;
+                let ttfb = snapshot.stats.last_ttfb_ms.unwrap_or(0);
+                let proxy = ui
+                    .proxy_state
+                    .get_or_insert_with(crate::proxy::ProxyState::new);
+                proxy
+                    .running
+                    .store(snapshot.proxy.running, Ordering::Relaxed);
+                *proxy.stats.write() = snapshot.stats.clone();
+                ui.snapshot = Some(snapshot);
+                ui.recent_events = events;
+                ui.recent_requests = requests;
+                ui.request_history = metrics
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.requests)
+                    .collect();
+                ui.failure_history = metrics
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.failures)
+                    .collect();
+                ui.ttfb_history = metrics
+                    .buckets
+                    .iter()
+                    .map(|bucket| bucket.average_ttfb_ms.unwrap_or(0))
+                    .collect();
+                ui.metrics = Some(metrics);
+                ui.metrics_1m = Some(metrics_1m);
+                if !ui.onboarding_checked {
+                    ui.onboarding_checked = true;
+                    if ui.workspace == crate::tui::Workspace::Proxy && ui.needs_onboarding() {
+                        ui.modal = crate::tui::Modal::Onboarding;
+                    }
+                }
+                if ui.request_history.is_empty() {
+                    ui.push_metric_sample(total_requests, failures, ttfb);
+                }
+            }
+            ControlUpdate::Disconnected => {
+                ui.attached_daemon = false;
+                ui.snapshot = None;
+            }
+        }
+    }
+}
+
+pub fn poll_action_updates(ui: &mut Ui) {
+    while let Ok(update) = ui.action_updates.try_recv() {
+        ui.notice = match update {
+            ActionUpdate::Success(message) | ActionUpdate::Error(message) => message,
+        };
+    }
 }

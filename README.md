@@ -64,13 +64,16 @@ For a checkout-only run / 仅试运行：`cargo run --release`。
 
 ### 🆕 Proxy Mode / 代理模式
 ```bash
-# TUI + embedded proxy (or attach to an existing project daemon)
+# Default launch opens ACCOUNT. Press m, then 2 for the PROXY workspace.
+codex-switcher
+
+# Open PROXY directly and start/attach the data plane
 codex-switcher --proxy
 
 # Or start a headless daemon
 codex-switcher --daemon
 
-# In the TUI: Settings → Enter to enable Codex integration.
+# In PROXY: Space manages the pool, s starts/stops, c configures Codex.
 # This safely writes a model_provider to $CODEX_HOME/config.toml.
 # Restart Codex after enabling or disabling it; HTTPS_PROXY is not used.
 
@@ -97,10 +100,12 @@ Snapshots live under `$XDG_DATA_HOME/codex-switcher/` (fallback `~/.local/share/
 
 | Key | Action |
 | --- | --- |
-| `Tab` / `Shift-Tab` | Switch Overview, Instances, Account Pool, Events, Settings |
-| `Space` | Add/remove selected account from the proxy pool |
-| `p` / `x` | Pause routing / manually switch at a safe request boundary |
-| `a` / `i` | Import current auth / JSON or path · 导入认证 |
+| `m`, then `1` / `2` | Switch between the ACCOUNT and PROXY workspaces |
+| `Tab` / `Shift-Tab`, `1`–`4` | Cycle or directly focus proxy dashboard panels |
+| `j` / `k` | Move inside the focused list (Vim navigation; arrow keys are not required) |
+| `Space` / `x` | Add/remove a proxy-pool account / switch at a safe request boundary |
+| `s` / `p` / `c` / `a` in PROXY | Start-stop proxy / pause / Codex integration / auto-switch |
+| `a` / `i` in ACCOUNT | Import current auth / JSON or path · 导入认证 |
 | `r` / `R` | Check selected / all accounts · 检测额度 |
 | `Enter` | Activate selected snapshot · 启用账户 |
 | `n` / `d` | Rename / delete · 重命名 / 删除 |

@@ -1,6 +1,6 @@
 use crate::identity::RequestIdentity;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{
@@ -18,7 +18,7 @@ pub struct RequestMetadata {
     pub identity: RequestIdentity,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InFlightRequest {
     pub method: String,
     pub path: String,

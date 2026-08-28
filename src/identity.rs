@@ -119,14 +119,12 @@ impl ProcessInspector for SystemProcessInspector {
             process_started_at: Some(process.start_time()),
             parent_pid: process.parent().map(|parent| parent.as_u32()),
             executable: process.exe().map(PathBuf::from),
-            command: (!process.cmd().is_empty()).then(|| {
-                process
-                    .cmd()
-                    .iter()
-                    .map(|part| part.to_string_lossy())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            }),
+            // Only retain argv[0]. Later arguments may contain a prompt or
+            // workspace data and must never enter monitoring snapshots.
+            command: process
+                .cmd()
+                .first()
+                .map(|program| program.to_string_lossy().into_owned()),
             working_directory: process.cwd().map(PathBuf::from),
         }
     }

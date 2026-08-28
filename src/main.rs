@@ -35,6 +35,9 @@ fn main() -> Result<()> {
     if cli.auto_switch {
         config.proxy.auto_switch = true;
     }
+    if cli.daemon {
+        config.proxy.enabled = true;
+    }
     let index = load_index(&p)?;
 
     if cli.daemon {
@@ -56,7 +59,7 @@ async fn async_main(cli: Cli, config: Config, index: AccountIndex, p: Paths) -> 
     }
 }
 
-fn run_proxy_tui(config: Config, index: AccountIndex, paths: Paths) -> Result<()> {
+fn run_proxy_tui(mut config: Config, index: AccountIndex, paths: Paths) -> Result<()> {
     // If the port belongs to our daemon, attach and leave it running when the
     // TUI exits. Otherwise create an embedded daemon and own its lifetime.
     let daemon_available = tokio::runtime::Runtime::new()
@@ -68,8 +71,19 @@ fn run_proxy_tui(config: Config, index: AccountIndex, paths: Paths) -> Result<()
         })
         .is_some();
     if daemon_available {
-        return codex_switcher::tui::start_interactive(config, index, None);
+        let _ = tokio::runtime::Runtime::new()?.block_on(control_request(
+            &paths,
+            hyper::Method::POST,
+            "/v1/proxy/start",
+        ));
+        return codex_switcher::tui::start_interactive_in(
+            config,
+            index,
+            None,
+            codex_switcher::tui::Workspace::Proxy,
+        );
     }
+    config.proxy.enabled = true;
     let daemon_config = config.clone();
     let daemon_index = index.clone();
     let daemon_paths = paths.clone();
@@ -94,9 +108,12 @@ fn run_proxy_tui(config: Config, index: AccountIndex, paths: Paths) -> Result<()
     let mut current_config = config;
     let mut current_index = index;
     loop {
-        if let Err(error) =
-            codex_switcher::tui::start_interactive(current_config, current_index, None)
-        {
+        if let Err(error) = codex_switcher::tui::start_interactive_in(
+            current_config,
+            current_index,
+            None,
+            codex_switcher::tui::Workspace::Proxy,
+        ) {
             let _ = tokio::runtime::Runtime::new()?.block_on(control_request(
                 &paths,
                 hyper::Method::POST,

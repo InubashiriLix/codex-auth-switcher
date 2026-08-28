@@ -44,6 +44,31 @@ pub struct RuntimeEvent {
     pub detail: String,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MetricBucket {
+    pub started_at: DateTime<Utc>,
+    pub requests: u64,
+    pub failures: u64,
+    pub average_ttfb_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MetricsWindow {
+    pub window_seconds: u64,
+    pub bucket_seconds: u64,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub rps: f64,
+    pub success_rate: f64,
+    pub ttfb_p50_ms: Option<u64>,
+    pub ttfb_p95_ms: Option<u64>,
+    pub ttfb_p99_ms: Option<u64>,
+    pub duration_p50_ms: Option<u64>,
+    pub duration_p95_ms: Option<u64>,
+    pub duration_p99_ms: Option<u64>,
+    pub buckets: Vec<MetricBucket>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RetentionPolicy {
     pub days: i64,
@@ -215,6 +240,167 @@ impl MetadataStore {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_error)
     }
+
+    pub fn recent_requests(
+        &self,
+        limit: usize,
+        offset: usize,
+        account_id: Option<Uuid>,
+        client_instance_id: Option<&str>,
+        status: Option<u16>,
+    ) -> Result<Vec<RequestSummary>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id,tenant_id,device_id,client_instance_id,session_key,started_at,
+                        method,path,status,stage,duration_ms,ttfb_ms,request_bytes,response_bytes,
+                        account_id,route_reason,retries,partial_failure
+                 FROM request_summaries ORDER BY started_at DESC LIMIT 50000",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map([], request_from_row)
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        Ok(rows
+            .into_iter()
+            .filter(|request| account_id.is_none_or(|id| request.account_id == Some(id)))
+            .filter(|request| client_instance_id.is_none_or(|id| request.client_instance_id == id))
+            .filter(|request| status.is_none_or(|status| request.status == Some(status)))
+            .skip(offset)
+            .take(limit.min(50_000))
+            .collect())
+    }
+
+    pub fn metrics(&self, window_seconds: u64, bucket_seconds: u64) -> Result<MetricsWindow> {
+        let window_seconds = window_seconds.clamp(10, 86_400);
+        let bucket_seconds = bucket_seconds.clamp(1, window_seconds);
+        let cutoff = Utc::now() - Duration::seconds(window_seconds as i64);
+        let requests = {
+            let connection = self.connection.lock();
+            let mut statement = connection
+                .prepare(
+                    "SELECT id,tenant_id,device_id,client_instance_id,session_key,started_at,
+                            method,path,status,stage,duration_ms,ttfb_ms,request_bytes,response_bytes,
+                            account_id,route_reason,retries,partial_failure
+                     FROM request_summaries WHERE started_at >= ?1 ORDER BY started_at DESC",
+                )
+                .map_err(db_error)?;
+            statement
+                .query_map([cutoff.to_rfc3339()], request_from_row)
+                .map_err(db_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_error)?
+        };
+        let total_requests = requests.len() as u64;
+        let successful_requests = requests
+            .iter()
+            .filter(|request| {
+                request
+                    .status
+                    .is_some_and(|status| (200..400).contains(&status))
+            })
+            .count() as u64;
+        let mut ttfb = requests
+            .iter()
+            .filter_map(|request| request.ttfb_ms)
+            .collect::<Vec<_>>();
+        let mut duration = requests
+            .iter()
+            .filter_map(|request| request.duration_ms)
+            .collect::<Vec<_>>();
+        ttfb.sort_unstable();
+        duration.sort_unstable();
+
+        let bucket_count = window_seconds.div_ceil(bucket_seconds) as usize;
+        let mut buckets = (0..bucket_count)
+            .map(|index| MetricBucket {
+                started_at: cutoff + Duration::seconds((index as u64 * bucket_seconds) as i64),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let mut ttfb_totals = vec![0u64; bucket_count];
+        let mut ttfb_counts = vec![0u64; bucket_count];
+        for request in &requests {
+            let elapsed = request
+                .started_at
+                .signed_duration_since(cutoff)
+                .num_seconds()
+                .max(0) as u64;
+            let index =
+                (elapsed / bucket_seconds).min(bucket_count.saturating_sub(1) as u64) as usize;
+            buckets[index].requests += 1;
+            if !request
+                .status
+                .is_some_and(|status| (200..400).contains(&status))
+            {
+                buckets[index].failures += 1;
+            }
+            if let Some(value) = request.ttfb_ms {
+                ttfb_totals[index] += value;
+                ttfb_counts[index] += 1;
+            }
+        }
+        for (index, bucket) in buckets.iter_mut().enumerate() {
+            bucket.average_ttfb_ms =
+                (ttfb_counts[index] > 0).then(|| ttfb_totals[index] / ttfb_counts[index]);
+        }
+        Ok(MetricsWindow {
+            window_seconds,
+            bucket_seconds,
+            total_requests,
+            successful_requests,
+            rps: total_requests as f64 / window_seconds as f64,
+            success_rate: if total_requests == 0 {
+                100.0
+            } else {
+                successful_requests as f64 * 100.0 / total_requests as f64
+            },
+            ttfb_p50_ms: percentile(&ttfb, 50),
+            ttfb_p95_ms: percentile(&ttfb, 95),
+            ttfb_p99_ms: percentile(&ttfb, 99),
+            duration_p50_ms: percentile(&duration, 50),
+            duration_p95_ms: percentile(&duration, 95),
+            duration_p99_ms: percentile(&duration, 99),
+            buckets,
+        })
+    }
+}
+
+fn request_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestSummary> {
+    let started_at: String = row.get(5)?;
+    let account_id: Option<String> = row.get(14)?;
+    Ok(RequestSummary {
+        id: row.get(0)?,
+        tenant_id: row.get(1)?,
+        device_id: row.get(2)?,
+        client_instance_id: row.get(3)?,
+        session_key: row.get(4)?,
+        started_at: DateTime::parse_from_rfc3339(&started_at)
+            .map(|time| time.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        method: row.get(6)?,
+        path: row.get(7)?,
+        status: row.get(8)?,
+        stage: row.get(9)?,
+        duration_ms: row.get(10)?,
+        ttfb_ms: row.get(11)?,
+        request_bytes: row.get(12)?,
+        response_bytes: row.get(13)?,
+        account_id: account_id.and_then(|id| Uuid::parse_str(&id).ok()),
+        route_reason: row.get(15)?,
+        retries: row.get(16)?,
+        partial_failure: row.get(17)?,
+    })
+}
+
+fn percentile(values: &[u64], percentile: usize) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let index = ((values.len() - 1) * percentile).div_ceil(100);
+    values.get(index).copied()
 }
 
 pub fn sanitize(message: &str) -> String {
@@ -277,5 +463,49 @@ mod tests {
         }
         store.cleanup().unwrap();
         assert_eq!(store.counts().unwrap().1, 1);
+    }
+
+    #[test]
+    fn metrics_include_percentiles_and_time_buckets() {
+        let path =
+            std::env::temp_dir().join(format!("codex-switcher-metrics-{}.sqlite", Uuid::new_v4()));
+        let store = MetadataStore::open(&path, RetentionPolicy::default()).unwrap();
+        for (index, status, ttfb) in [(0, 200, 10), (1, 500, 90), (2, 200, 50)] {
+            store
+                .record_request(&RequestSummary {
+                    id: index.to_string(),
+                    tenant_id: "local".into(),
+                    device_id: "test".into(),
+                    client_instance_id: "instance".into(),
+                    session_key: None,
+                    started_at: Utc::now(),
+                    method: "POST".into(),
+                    path: "/responses".into(),
+                    status: Some(status),
+                    stage: "completed".into(),
+                    duration_ms: Some(ttfb + 20),
+                    ttfb_ms: Some(ttfb),
+                    request_bytes: 0,
+                    response_bytes: 0,
+                    account_id: None,
+                    route_reason: "test".into(),
+                    retries: 0,
+                    partial_failure: status >= 500,
+                })
+                .unwrap();
+        }
+        let metrics = store.metrics(300, 10).unwrap();
+        assert_eq!(metrics.total_requests, 3);
+        assert_eq!(metrics.successful_requests, 2);
+        assert_eq!(metrics.ttfb_p50_ms, Some(50));
+        assert_eq!(metrics.ttfb_p95_ms, Some(90));
+        assert_eq!(
+            metrics
+                .buckets
+                .iter()
+                .map(|bucket| bucket.requests)
+                .sum::<u64>(),
+            3
+        );
     }
 }

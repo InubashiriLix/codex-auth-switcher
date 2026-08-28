@@ -171,6 +171,18 @@ impl Router {
         self.bindings.lock().remove(sticky_key);
     }
 
+    pub fn binding_for(&self, sticky_key: &str) -> Option<Uuid> {
+        self.bindings.lock().get(sticky_key).copied()
+    }
+
+    pub fn binding_counts(&self) -> HashMap<Uuid, usize> {
+        let mut counts = HashMap::new();
+        for account_id in self.bindings.lock().values() {
+            *counts.entry(*account_id).or_insert(0) += 1;
+        }
+        counts
+    }
+
     pub fn open_circuit(
         &self,
         account_id: Uuid,

@@ -17,7 +17,8 @@ use uuid::Uuid;
 pub const PROVIDER_ID: &str = "codex-switcher";
 pub const DEFAULT_PROXY_BASE_URL: &str = "http://127.0.0.1:8765/backend-api/codex";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "detail", rename_all = "snake_case")]
 pub enum IntegrationStatus {
     Disabled,
     Enabled,
