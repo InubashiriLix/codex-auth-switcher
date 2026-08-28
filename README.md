@@ -21,11 +21,8 @@ Codex Switcher 是一个面向 Codex CLI 的本地账号管理器与反向代理
 
 ## 先看一眼
 
-<!--
-TODO: 在这里加入一张脱敏后的 PROXY 工作区截图。
-截图请使用虚构账号，并裁掉终端背景、日志、邮箱、主目录与其他个人信息。
-建议宽度：1400–1800 px。
--->
+<img width="2261" height="1280" alt="c9c233b9aacb14df47fe72a4e25aae18" src="https://github.com/user-attachments/assets/be40333a-842a-4407-8df4-a9c16d4ed39d" />
+
 
 > 📷 **截图正在准备中。** TUI 已经可以使用；我们希望放上来的第一张图是干净、脱敏、真正能代表项目体验的版本。
 
