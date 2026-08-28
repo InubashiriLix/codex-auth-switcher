@@ -1,0 +1,24 @@
+[Unit]
+Description=Codex Authentication Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=%h/.cargo/bin/codex-switcher --daemon
+ExecReload=/bin/kill -SIGHUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+
+# 环境变量
+Environment="RUST_LOG=info"
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+
+# 通知systemd服务已就绪
+NotifyAccess=main
+
+[Install]
+WantedBy=default.target

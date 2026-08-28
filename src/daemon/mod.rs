@@ -1,0 +1,411 @@
+mod hot_reload;
+mod control;
+mod notifications;
+
+pub use hot_reload::{HotReloader, ReloadEvent};
+pub use control::{check_daemon_status, send_reload_signal, send_stop_signal, write_pid_file, remove_pid_file};
+pub use notifications::NotificationManager;
+
+use crate::{
+    account::load_index,
+    config::{load_config, Config},
+    error::*,
+    paths::Paths,
+    proxy::{AccountSwitcher, ProxyServer, ProxyState, Recommender, SwitchDecision, TokenMonitor},
+    types::{AccountIndex, StatusKind},
+};
+use chrono::Utc;
+use parking_lot::RwLock;
+use std::{
+    fs,
+    pin::Pin,
+    future::Future,
+    sync::{
+        atomic::Ordering,
+        Arc,
+    },
+    time::Duration,
+};
+use tokio::signal::unix::{signal, SignalKind};
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+pub struct DaemonState {
+    pub config: Config,
+    pub accounts: Arc<RwLock<AccountIndex>>,
+    pub current_account: Arc<RwLock<Option<Uuid>>>,
+    pub proxy_server: Arc<ProxyServer>,
+    pub proxy_state: ProxyState,
+    pub hot_reloader: HotReloader,
+    pub recommender: Recommender,
+    pub paths: Paths,
+}
+
+impl DaemonState {
+    pub fn new(
+        config: Config,
+        index: AccountIndex,
+        paths: Paths,
+    ) -> Result<Self> {
+        let accounts = Arc::new(RwLock::new(index));
+        let current_account = Arc::new(RwLock::new(Self::find_active_account(&config, &accounts)));
+        let proxy_state = ProxyState::new();
+
+        // 设置初始统计
+        if let Some(id) = *current_account.read() {
+            proxy_state.stats.write().current_account = Some(id);
+        }
+
+        let proxy_server = Arc::new(ProxyServer::new(
+            config.clone(),
+            config.proxy.clone(),
+            accounts.clone(),
+            current_account.clone(),
+            proxy_state.stats.clone(),
+        ));
+
+        let recommender = Recommender::new(config.proxy.strategy.clone());
+        let hot_reloader = HotReloader::new(&paths)?;
+
+        Ok(Self {
+            config,
+            accounts,
+            current_account,
+            proxy_server,
+            proxy_state,
+            hot_reloader,
+            recommender,
+            paths,
+        })
+    }
+
+    fn find_active_account(config: &Config, accounts: &Arc<RwLock<AccountIndex>>) -> Option<Uuid> {
+        let active_path = config.codex_home.join("auth.json");
+        if !active_path.exists() {
+            return None;
+        }
+
+        let active_content = fs::read(&active_path).ok()?;
+        let accounts = accounts.read();
+
+        accounts
+            .accounts
+            .iter()
+            .find(|account| {
+                let snapshot_path = crate::account::snapshot_path(config, account.id);
+                fs::read(&snapshot_path)
+                    .ok()
+                    .map(|content| content == active_content)
+                    .unwrap_or(false)
+            })
+            .map(|account| account.id)
+    }
+
+    pub async fn handle_reload(&mut self, event: ReloadEvent) -> Result<()> {
+        match event {
+            ReloadEvent::AccountsChanged => {
+                info!("Accounts changed, reloading...");
+                let new_index = load_index(&self.paths)?;
+
+                // 检查当前活跃账户是否还存在
+                let current_id = *self.current_account.read();
+                if let Some(id) = current_id {
+                    let still_valid = new_index.accounts.iter().any(|a| a.id == id);
+
+                    if !still_valid {
+                        warn!("Current account removed, switching to fallback");
+                        self.switch_to_fallback(&new_index).await?;
+                    }
+                }
+
+                // 更新账户列表
+                *self.accounts.write() = new_index;
+                info!("Account index reloaded");
+            }
+
+            ReloadEvent::ConfigChanged => {
+                info!("Config changed, reloading...");
+                let new_config = load_config(&self.paths)?;
+
+                // 只更新可以安全热更新的部分
+                self.config.proxy = new_config.proxy.clone();
+                self.config.theme = new_config.theme;
+
+                info!("Configuration reloaded");
+            }
+
+            ReloadEvent::SnapshotChanged => {
+                info!("Account snapshot changed, will re-probe on next check");
+            }
+        }
+        Ok(())
+    }
+
+    async fn switch_to_fallback(&mut self, index: &AccountIndex) -> Result<()> {
+        // 等待所有活跃请求完成
+        let timeout = Duration::from_secs(30);
+        let drained = self
+            .proxy_server
+            .connection_tracker()
+            .wait_for_drain(timeout);
+
+        if !drained {
+            warn!(
+                "Timeout waiting for {} connections, forcing switch",
+                self.proxy_server.connection_tracker().active_count()
+            );
+        }
+
+        // 找到第一个可用账户
+        if let Some(account) = index.accounts.iter().find(|a| a.status.kind == StatusKind::Live)
+        {
+            *self.current_account.write() = Some(account.id);
+            self.proxy_state.stats.write().current_account = Some(account.id);
+            info!("Switched to fallback account: {}", account.label);
+        } else {
+            warn!("No live accounts available for fallback");
+        }
+
+        Ok(())
+    }
+
+    pub async fn switch_account(&mut self, target_id: Uuid) -> Result<()> {
+        let accounts = self.accounts.read();
+        let target = accounts
+            .accounts
+            .iter()
+            .find(|a| a.id == target_id)
+            .ok_or_else(|| AppError::Message("Target account not found".into()))?;
+
+        // 等待活跃请求完成
+        let timeout = Duration::from_secs(self.config.proxy.cooldown_seconds);
+        let _ = self
+            .proxy_server
+            .connection_tracker()
+            .wait_for_drain(timeout);
+
+        // 执行切换
+        *self.current_account.write() = Some(target_id);
+
+        let mut stats = self.proxy_state.stats.write();
+        stats.current_account = Some(target_id);
+        stats.auto_switches += 1;
+        stats.last_switch = Some(Utc::now());
+
+        info!("Switched to account: {}", target.label);
+
+        // 发送桌面通知
+        if let Err(e) = self.send_notification(&format!("已切换到账户: {}", target.label)) {
+            warn!("Failed to send notification: {}", e);
+        }
+
+        Ok(())
+    }
+
+    fn send_notification(&self, message: &str) -> Result<()> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            use notify_rust::Notification;
+            Notification::new()
+                .summary("Codex Switcher")
+                .body(message)
+                .timeout(5000)
+                .show()
+                .map_err(|e| AppError::Message(format!("Notification error: {}", e)))?;
+        }
+        Ok(())
+    }
+}
+
+pub fn run_daemon(
+    config: Config,
+    index: AccountIndex,
+    paths: Paths,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    Box::pin(run_daemon_impl(config, index, paths))
+}
+
+async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> Result<()> {
+    // 初始化守护进程状态
+    let mut state = DaemonState::new(config.clone(), index, paths.clone())?;
+
+    state.proxy_state.running.store(true, Ordering::Relaxed);
+
+    // 写入PID文件
+    write_pid_file(&paths)?;
+
+    // 启动代理服务器
+    let proxy_handle = {
+        let proxy = state.proxy_server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = proxy.serve().await {
+                error!("Proxy server error: {}", e);
+            }
+        })
+    };
+
+    // 启动热重载监控
+    let _reload_handle = {
+        let mut state_clone = state.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Some(event) = state_clone.hot_reloader.poll() {
+                    if let Err(e) = state_clone.handle_reload(event).await {
+                        error!("Hot reload failed: {}", e);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+
+    // 启动Token监控
+    let _monitor_handle = {
+        let monitor = Arc::new(TokenMonitor::new(
+            state.config.clone(),
+            state.accounts.clone(),
+            state.current_account.clone(),
+            &state.config.proxy,
+        ));
+        tokio::spawn(async move {
+            monitor.start_monitoring().await;
+        })
+    };
+
+    // 启动自动切换检测（如果启用）
+    if state.config.proxy.auto_switch {
+        let _switch_handle = {
+            let switcher = Arc::new(AccountSwitcher::new(
+                state.config.proxy.clone(),
+                Recommender::new(state.config.proxy.strategy.clone()),
+            ));
+            let mut state_clone = state.clone();
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    interval.tick().await;
+
+                    match switcher.check_and_switch(&state_clone) {
+                        Ok(SwitchDecision::Switch { target, reason }) => {
+                            info!("自动切换触发: {} → {}", reason, target);
+                            if let Err(e) = switcher.execute_switch(&mut state_clone, target).await {
+                                error!("自动切换失败: {}", e);
+                            }
+                        }
+                        Ok(SwitchDecision::Wait { reason }) => {
+                            info!("切换等待: {}", reason);
+                        }
+                        Ok(SwitchDecision::NoAction) => {}
+                        Err(e) => {
+                            error!("切换检测失败: {}", e);
+                        }
+                    }
+                }
+            })
+        };
+    }
+
+    // 通知systemd服务已就绪
+    #[cfg(unix)]
+    {
+        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+    }
+    info!("Daemon started and ready");
+
+    // 处理信号
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sighup = signal(SignalKind::hangup())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    tokio::select! {
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM, shutting down gracefully");
+        }
+        _ = sigint.recv() => {
+            info!("Received SIGINT, shutting down gracefully");
+        }
+        _ = sighup.recv() => {
+            info!("Received SIGHUP, reloading configuration");
+            #[cfg(unix)]
+            {
+                let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Reloading]);
+            }
+            if let Err(e) = force_reload_all(&mut state).await {
+                error!("Force reload failed: {}", e);
+            }
+            #[cfg(unix)]
+            {
+                let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+            }
+            // 克隆数据，释放锁
+            let accounts_clone = state.accounts.read().clone();
+            // 继续运行，重新调用
+            return Box::pin(run_daemon_impl(state.config, accounts_clone, state.paths)).await;
+        }
+        result = proxy_handle => {
+            error!("Proxy server exited unexpectedly: {:?}", result);
+        }
+    }
+
+    // 优雅关闭
+    shutdown_gracefully(&state).await?;
+
+    // 清理PID文件
+    remove_pid_file(&paths)?;
+
+    Ok(())
+}
+
+async fn shutdown_gracefully(state: &DaemonState) -> Result<()> {
+    info!("Draining active connections...");
+    #[cfg(unix)]
+    {
+        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
+    }
+
+    state.proxy_state.running.store(false, Ordering::Relaxed);
+    state.proxy_server.stop_accepting().await;
+
+    let drained = state
+        .proxy_server
+        .connection_tracker()
+        .wait_for_drain(Duration::from_secs(30));
+
+    if !drained {
+        warn!(
+            "Force closing {} connections",
+            state.proxy_server.connection_tracker().active_count()
+        );
+    }
+
+    info!("Shutdown complete");
+    Ok(())
+}
+
+async fn force_reload_all(state: &mut DaemonState) -> Result<()> {
+    let new_config = load_config(&state.paths)?;
+    let new_index = load_index(&state.paths)?;
+
+    state.config = new_config;
+    *state.accounts.write() = new_index;
+
+    info!("Full reload completed");
+    Ok(())
+}
+
+// 让DaemonState可以克隆（用于在不同任务间共享）
+impl Clone for DaemonState {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            accounts: self.accounts.clone(),
+            current_account: self.current_account.clone(),
+            proxy_server: self.proxy_server.clone(),
+            proxy_state: self.proxy_state.clone(),
+            hot_reloader: self.hot_reloader.clone(),
+            recommender: Recommender::new(self.config.proxy.strategy.clone()),
+            paths: self.paths.clone(),
+        }
+    }
+}

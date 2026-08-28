@@ -1,11 +1,23 @@
 # Codex Switcher
 
-> A fast, local-first TUI for managing multiple Codex CLI authentication snapshots.
+> A fast, local-first TUI for managing multiple Codex CLI authentication snapshots, with intelligent proxy mode for automatic token management.
 
 [![Rust](https://img.shields.io/badge/built_with-Rust-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Codex Switcher lets you keep several **your own** Codex CLI logins locally, inspect quota windows, and activate a snapshot without copying tokens by hand. It is terminal-native, privacy-minded, and designed for people who live in the shell.
+Codex Switcher lets you keep several **your own** Codex CLI logins locally, inspect quota windows, and activate a snapshot without copying tokens by hand. **NEW**: Proxy mode enables automatic token monitoring and smart account switching for uninterrupted Codex CLI usage.
+
+## ✨ New: Proxy Mode
+
+**Intelligent proxy between Codex CLI and ChatGPT API:**
+- 🔍 **Auto-monitoring**: Checks token usage every 30 seconds
+- 🤖 **Smart recommendations**: Three strategies (Smart, MaxRemaining, RoundRobin)
+- 🔄 **Hot reload**: Update accounts/config without restarting
+- 🎯 **Zero-downtime**: Graceful connection handling
+- 📊 **Statistics**: Track requests, failures, auto-switches
+- 🔧 **Systemd ready**: Run as a system service
+
+See [PROXY_MODE.md](PROXY_MODE.md) for full documentation.
 
 ## Why it is useful
 
@@ -46,10 +58,38 @@ For a checkout-only run / 仅试运行：`cargo run --release`。
 
 ## Quick start / 快速开始
 
+### Traditional TUI Mode / 传统TUI模式
 1. Close running Codex sessions / 关闭正在运行的 Codex。
 2. Press `a` to import the current login, or `i` to import JSON / 按 `a` 导入当前登录，或按 `i` 导入 JSON。
 3. Press `r` or `R` to check one or all accounts / 按 `r` 或 `R` 检测额度。
 4. Select an account and press `Enter` to activate it / 选择账户后按 `Enter` 启用。
+
+### 🆕 Proxy Mode / 代理模式
+```bash
+# Start daemon
+codex-switcher --daemon
+
+# Configure Codex CLI to use the proxy
+export HTTPS_PROXY=http://127.0.0.1:8765
+
+# Check status
+codex-switcher daemon-status
+
+# Hot reload config
+codex-switcher daemon-reload
+
+# Stop daemon
+codex-switcher daemon-stop
+```
+
+**Systemd service:**
+```bash
+cp codex-switcher.service ~/.config/systemd/user/
+systemctl --user enable codex-switcher.service
+systemctl --user start codex-switcher.service
+```
+
+See [PROXY_MODE.md](PROXY_MODE.md) for detailed proxy mode documentation.
 
 Snapshots live under `$XDG_DATA_HOME/codex-switcher/` (fallback `~/.local/share/codex-switcher/`). Configuration lives under `$XDG_CONFIG_HOME/codex-switcher/config.toml` (fallback `~/.config/codex-switcher/`). Press `s` to change the Codex home directory.
 

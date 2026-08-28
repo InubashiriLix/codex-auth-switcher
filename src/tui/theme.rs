@@ -1,0 +1,97 @@
+use crate::types::Theme;
+use ratatui::style::Color;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ThemeColors {
+    pub background: Color,
+    pub surface: Color,
+    pub text: Color,
+    pub muted: Color,
+    pub border: Color,
+    pub focus: Color,
+    pub selected_bg: Color,
+    pub selected_text: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub error: Color,
+    pub unknown: Color,
+    pub progress_track: Color,
+    pub progress_fill: Color,
+    pub progress_text: Color,
+}
+
+impl Theme {
+    pub fn colors(self) -> ThemeColors {
+        let rgb = Color::Rgb;
+        match self {
+            Self::Midnight => ThemeColors {
+                background: rgb(10, 15, 26),
+                surface: rgb(20, 29, 45),
+                text: rgb(242, 247, 255),
+                muted: rgb(170, 187, 209),
+                border: rgb(91, 118, 154),
+                focus: rgb(98, 210, 255),
+                selected_bg: rgb(32, 79, 116),
+                selected_text: rgb(255, 255, 255),
+                success: rgb(87, 230, 150),
+                warning: rgb(255, 202, 87),
+                error: rgb(255, 111, 116),
+                unknown: rgb(165, 180, 201),
+                progress_track: rgb(50, 65, 85),
+                progress_fill: rgb(42, 176, 123),
+                progress_text: rgb(255, 255, 255),
+            },
+            Self::Nord => ThemeColors {
+                background: rgb(46, 52, 64),
+                surface: rgb(59, 66, 82),
+                text: rgb(236, 239, 244),
+                muted: rgb(216, 222, 233),
+                border: rgb(136, 192, 208),
+                focus: rgb(136, 192, 208),
+                selected_bg: rgb(67, 94, 115),
+                selected_text: rgb(255, 255, 255),
+                success: rgb(163, 190, 140),
+                warning: rgb(235, 203, 139),
+                error: rgb(191, 97, 106),
+                unknown: rgb(180, 188, 204),
+                progress_track: rgb(76, 86, 106),
+                progress_fill: rgb(94, 129, 172),
+                progress_text: rgb(255, 255, 255),
+            },
+            Self::Gruvbox => ThemeColors {
+                background: rgb(40, 40, 40),
+                surface: rgb(60, 56, 54),
+                text: rgb(251, 241, 199),
+                muted: rgb(213, 196, 161),
+                border: rgb(168, 153, 132),
+                focus: rgb(131, 165, 152),
+                selected_bg: rgb(104, 92, 70),
+                selected_text: rgb(255, 251, 235),
+                success: rgb(184, 187, 38),
+                warning: rgb(250, 189, 47),
+                error: rgb(251, 73, 52),
+                unknown: rgb(189, 174, 147),
+                progress_track: rgb(80, 73, 69),
+                progress_fill: rgb(152, 151, 26),
+                progress_text: rgb(255, 255, 255),
+            },
+            Self::Paper => ThemeColors {
+                background: rgb(250, 250, 247),
+                surface: rgb(255, 255, 255),
+                text: rgb(20, 28, 38),
+                muted: rgb(74, 88, 105),
+                border: rgb(68, 93, 118),
+                focus: rgb(0, 93, 160),
+                selected_bg: rgb(0, 93, 160),
+                selected_text: rgb(255, 255, 255),
+                success: rgb(0, 112, 62),
+                warning: rgb(153, 92, 0),
+                error: rgb(181, 35, 24),
+                unknown: rgb(85, 99, 115),
+                progress_track: rgb(202, 214, 224),
+                progress_fill: rgb(0, 102, 178),
+                progress_text: rgb(255, 255, 255),
+            },
+        }
+    }
+}

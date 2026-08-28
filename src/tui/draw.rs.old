@@ -1,0 +1,157 @@
+use super::{Modal, Ui};
+use ratatui::{
+    Frame,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+};
+use std::sync::atomic::Ordering;
+
+const HELP_TEXT: &str = "j/k 或 ↑/↓ 移动 · Enter 启用 · t 切换主题
+m 模式选择 · ? 帮助 · q 退出
+Esc 关闭弹窗";
+
+pub fn draw(f: &mut Frame, ui: &Ui) {
+    let theme = ui.config.theme.colors();
+
+    // 设置背景
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.background)),
+        f.area(),
+    );
+
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(2),
+        ])
+        .split(f.area());
+
+    // 标题栏
+    let title = format!(
+        " Codex Switcher v{}  ·  {} 个账户 ",
+        env!("CARGO_PKG_VERSION"),
+        ui.index.accounts.len()
+    );
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                title,
+                Style::default()
+                    .fg(theme.focus)
+                    .bg(theme.surface)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  [m]模式 [t]主题 [?]帮助 [q]退出",
+                Style::default().fg(theme.text).bg(theme.surface),
+            ),
+        ]))
+        .style(Style::default().bg(theme.surface))
+        .block(block(theme, "")),
+        areas[0],
+    );
+
+    // 主内容区
+    draw_main_content(f, areas[1], ui, theme);
+
+    // 状态栏
+    let status_text = if let Some(proxy_state) = &ui.proxy_state {
+        let running = proxy_state.running.load(Ordering::Relaxed);
+        let stats = proxy_state.stats.read();
+        if running {
+            format!(
+                " 代理模式运行中 · 已处理 {} 请求 · {}",
+                stats.total_requests, ui.notice
+            )
+        } else {
+            format!(" 代理模式已停止 · {}", ui.notice)
+        }
+    } else {
+        format!(" {}", ui.notice)
+    };
+
+    f.render_widget(
+        Paragraph::new(status_text)
+            .style(Style::default().fg(theme.muted).bg(theme.background))
+            .block(
+                Block::default()
+                    .borders(Borders::TOP)
+                    .style(Style::default().fg(theme.border).bg(theme.background)),
+            ),
+        areas[2],
+    );
+
+    // 绘制modal
+    if ui.modal != Modal::None {
+        draw_modal(f, ui, theme);
+    }
+}
+
+fn draw_main_content(f: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors) {
+    let text = if ui.index.accounts.is_empty() {
+        "没有账户。\n\n请使用原有TUI功能导入账户，\n或运行 codex-switcher --daemon 启动守护进程。"
+    } else {
+        "账户管理功能完整实现中...\n\n当前可用:\n- 守护进程模式 (--daemon)\n- 代理模式 (--proxy)\n- 热重载支持"
+    };
+
+    f.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.text).bg(theme.surface))
+            .block(block(theme, "状态")),
+        area,
+    );
+}
+
+fn draw_modal(f: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
+    let popup = centered(70, 30, f.area());
+    f.render_widget(Clear, popup);
+
+    let (title, text) = match ui.modal {
+        Modal::Help => ("帮助", HELP_TEXT),
+        Modal::ModeSelector => (
+            "模式选择",
+            "1. 交互模式（当前）\n2. 代理模式（手动切换）\n3. 代理模式（自动切换）\n\nEsc 取消",
+        ),
+        _ => ("", &ui.input[..]),
+    };
+
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(theme.text).bg(theme.surface))
+            .block(block(theme, title)),
+        popup,
+    );
+}
+
+fn block<'a>(theme: super::ThemeColors, title: &'a str) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().fg(theme.border).bg(theme.surface))
+}
+
+fn centered(x: u16, y: u16, area: Rect) -> Rect {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - y) / 2),
+            Constraint::Percentage(y),
+            Constraint::Percentage((100 - y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - x) / 2),
+            Constraint::Percentage(x),
+            Constraint::Percentage((100 - x) / 2),
+        ])
+        .split(v[1])[1]
+}

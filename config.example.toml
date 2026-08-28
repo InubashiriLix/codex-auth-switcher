@@ -1,0 +1,161 @@
+# Codex Switcher 配置示例 / Example Configuration
+# 复制到 ~/.config/codex-switcher/config.toml 并根据需要修改
+# Copy to ~/.config/codex-switcher/config.toml and modify as needed
+
+# Codex CLI 主目录
+codex_home = "/home/user/.codex"
+
+# 账户快照存储目录
+accounts_dir = "/home/user/.local/share/codex-switcher/accounts"
+
+# TUI主题：midnight（默认）, nord, gruvbox, paper
+theme = "midnight"
+
+# 运行模式配置 / Operation Mode
+[mode]
+# 模式类型：interactive（交互式TUI）或 proxy_daemon（代理守护进程）
+type = "interactive"
+# type = "proxy_daemon"
+
+# 仅在 proxy_daemon 模式下有效
+auto_switch = false      # 是否自动切换账户
+notify_user = true       # 是否发送桌面通知
+
+# 代理服务器配置 / Proxy Configuration
+[proxy]
+# 是否启用代理功能
+enabled = false
+
+# 监听地址和端口
+# 默认只监听本地，提高安全性
+listen_addr = "127.0.0.1:8765"
+
+# 是否启用自动切换（优先级高于 mode.auto_switch）
+auto_switch = false
+
+# Token使用率阈值（百分比）
+# 当使用率超过此值时，触发切换推荐或自动切换
+# 建议值：70-95
+threshold = 85.0
+
+# 切换后的冷却时间（秒）
+# 防止频繁切换
+cooldown_seconds = 5
+
+# 账户推荐策略
+# - "smart": 智能算法（剩余百分比 + 重置时间加成）
+# - "max_remaining": 选择剩余token最多的账户
+# - "round_robin": 轮询所有可用账户
+strategy = "smart"
+
+# ChatGPT API基础URL
+# 通常不需要修改，除非使用自定义endpoint
+target_base = "https://chatgpt.com"
+
+# 高级配置示例 / Advanced Configuration Examples
+
+# === 示例1：开发环境 ===
+# [proxy]
+# enabled = true
+# listen_addr = "127.0.0.1:8765"
+# auto_switch = false       # 手动切换，便于调试
+# threshold = 90.0          # 高阈值，最大化利用
+# strategy = "max_remaining"
+
+# === 示例2：生产环境（自动切换）===
+# [mode]
+# type = "proxy_daemon"
+# auto_switch = true
+# notify_user = true
+#
+# [proxy]
+# enabled = true
+# listen_addr = "127.0.0.1:8765"
+# auto_switch = true        # 启用自动切换
+# threshold = 85.0          # 保守阈值
+# cooldown_seconds = 10     # 较长冷却时间
+# strategy = "smart"
+
+# === 示例3：多账户轮询 ===
+# [proxy]
+# enabled = true
+# threshold = 70.0          # 较低阈值，频繁切换
+# strategy = "round_robin"  # 均匀分配负载
+
+# === 示例4：保守策略 ===
+# [proxy]
+# enabled = true
+# threshold = 75.0          # 更低阈值
+# cooldown_seconds = 15     # 更长冷却
+# strategy = "smart"
+
+# 配置优先级说明 / Configuration Priority
+# 1. 命令行参数优先级最高
+#    例如：--auto-switch 会覆盖配置文件
+# 2. 配置文件次之
+# 3. 默认值最低
+
+# 使用建议 / Usage Tips
+#
+# 监控频率：
+#   - 默认每30秒检查一次token使用情况
+#   - 如需修改，编辑 src/proxy/monitor.rs
+#
+# 阈值选择：
+#   - 85%：平衡性能和稳定性（推荐）
+#   - 95%：激进策略，最大化利用
+#   - 70%：保守策略，提前切换
+#
+# 策略选择：
+#   - smart：适合大多数场景，综合考虑多个因素
+#   - max_remaining：简单直接，适合账户配额差异大的情况
+#   - round_robin：负载均衡，适合账户配额相近的情况
+#
+# 冷却时间：
+#   - 5秒：快速响应（默认）
+#   - 10-15秒：减少切换频率
+#   - 30秒+：极保守，但可能影响体验
+
+# 热重载支持 / Hot Reload Support
+#
+# 以下配置项支持热重载（无需重启守护进程）：
+# ✅ proxy.threshold
+# ✅ proxy.cooldown_seconds
+# ✅ proxy.strategy
+# ✅ theme
+# ✅ accounts_dir（新账户会被自动加载）
+#
+# 以下配置项需要重启才能生效：
+# ❌ proxy.listen_addr
+# ❌ proxy.target_base
+# ❌ codex_home
+#
+# 热重载方法：
+#   1. 修改配置文件
+#   2. 运行: codex-switcher daemon-reload
+#   3. 或发送: systemctl --user reload codex-switcher.service
+
+# 故障排查 / Troubleshooting
+#
+# 代理无法启动：
+#   - 检查端口是否被占用: lsof -i :8765
+#   - 检查PID文件: ls -la $XDG_RUNTIME_DIR/codex-switcher.pid
+#   - 查看日志: RUST_LOG=debug codex-switcher --daemon
+#
+# 账户不切换：
+#   - 检查阈值设置是否过高
+#   - 确认 auto_switch = true
+#   - 查看日志中的推荐信息
+#
+# 热重载失败：
+#   - 确认守护进程正在运行: codex-switcher daemon-status
+#   - 检查配置文件语法: toml-cli check config.toml
+#   - 查看systemd日志: journalctl --user -u codex-switcher.service
+
+# 安全建议 / Security Recommendations
+#
+# 1. 只监听本地地址（127.0.0.1）
+# 2. 不要在公共网络上暴露代理端口
+# 3. 定期检查快照文件权限（应为 0600）
+# 4. 使用 systemd 的安全特性（NoNewPrivileges, PrivateTmp）
+# 5. 不要将此配置文件提交到版本控制系统
