@@ -1,4 +1,6 @@
-use super::{DetailPage, Modal, ProxyPanel, Ui, Workspace, actions::*, draw};
+use super::{
+    DetailPage, HelpPage, InputSuggestion, Modal, ProxyPanel, Ui, Workspace, actions::*, draw,
+};
 use crate::{
     error::{AppError, Result},
     paths::Paths,
@@ -9,8 +11,9 @@ use hyper::Method;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use serde_json::json;
 use std::{
-    io,
-    path::PathBuf,
+    collections::HashSet,
+    fs, io,
+    path::{MAIN_SEPARATOR, Path, PathBuf},
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
@@ -70,7 +73,7 @@ pub fn handle_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
         return Ok(false);
     }
     if key.code == KeyCode::Char('?') {
-        ui.modal = Modal::Help;
+        ui.open_help();
         return Ok(false);
     }
     if key.code == KeyCode::Char('t') {
@@ -113,7 +116,7 @@ fn handle_detail_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> 
         KeyCode::Enter | KeyCode::Char(' ') => match ui.control_selected {
             0 => {
                 ui.detail = None;
-                ui.modal = if matches!(
+                let modal = if matches!(
                     ui.runtime_state(),
                     RuntimeState::Running | RuntimeState::Paused | RuntimeState::Starting
                 ) {
@@ -121,21 +124,23 @@ fn handle_detail_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> 
                 } else {
                     Modal::ConfirmProxyStart
                 };
+                ui.open_confirmation(modal);
             }
             1 => {
                 ui.detail = None;
-                ui.modal = if ui.integration_enabled() {
+                let modal = if ui.integration_enabled() {
                     Modal::ConfirmIntegrationDisable
                 } else {
                     Modal::ConfirmIntegrationEnable
                 };
+                ui.open_confirmation(modal);
             }
             2 => {
                 if ui.config.proxy.auto_switch {
                     set_auto_switch(paths, ui, false);
                 } else {
                     ui.detail = None;
-                    ui.modal = Modal::ConfirmAutoSwitch;
+                    ui.open_confirmation(Modal::ConfirmAutoSwitch);
                 }
             }
             3 => cycle_strategy(paths, ui),
@@ -154,7 +159,7 @@ fn request_exit(ui: &mut Ui) -> Result<bool> {
         .map(|snapshot| snapshot.active_requests.len())
         .unwrap_or(0);
     if ui.owned_daemon.is_some() && active > 0 {
-        ui.modal = Modal::ConfirmExit;
+        ui.open_confirmation(Modal::ConfirmExit);
         ui.notice = format!("仍有 {active} 个活动请求");
         Ok(false)
     } else {
@@ -178,35 +183,36 @@ fn handle_account_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool>
             ui.notice = "已清除过滤".into();
         }
         KeyCode::Char('/') => {
-            ui.input.clear();
-            ui.modal = Modal::Filter;
+            ui.open_text_editor(Modal::Filter, ui.filter.clone());
+            refresh_completions(ui);
         }
         KeyCode::Char('a') => {
             ui.notice = import_current_auth(&ui.config, &mut ui.index, paths)
                 .unwrap_or_else(|error| error.to_string());
         }
         KeyCode::Char('i') => {
-            ui.input.clear();
-            ui.modal = Modal::Import;
+            ui.open_text_editor(Modal::Import, String::new());
+            refresh_completions(ui);
         }
         KeyCode::Char('n') => {
             if let Some(index) = ui.selected_id() {
                 if ui.index.accounts[index].email.is_some() {
-                    ui.modal = Modal::ConfirmUseEmail;
+                    ui.open_confirmation(Modal::ConfirmUseEmail);
                 } else {
-                    ui.input.clone_from(&ui.index.accounts[index].label);
-                    ui.modal = Modal::Rename;
+                    let value = ui.index.accounts[index].label.clone();
+                    ui.open_text_editor(Modal::Rename, value);
+                    refresh_completions(ui);
                 }
             }
         }
         KeyCode::Char('d') => {
             if ui.selected_id().is_some() {
-                ui.modal = Modal::ConfirmDelete;
+                ui.open_confirmation(Modal::ConfirmDelete);
             }
         }
         KeyCode::Char('s') => {
-            ui.input = ui.config.codex_home.display().to_string();
-            ui.modal = Modal::Settings;
+            ui.open_text_editor(Modal::Settings, ui.config.codex_home.display().to_string());
+            refresh_completions(ui);
         }
         KeyCode::Char('r') => {
             if let Some(index) = ui.selected_id() {
@@ -255,7 +261,7 @@ fn handle_proxy_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
         }
         KeyCode::Char('x') if ui.proxy_panel == ProxyPanel::Pool => switch_route(paths, ui),
         KeyCode::Char('s') => {
-            ui.modal = if matches!(
+            let modal = if matches!(
                 ui.runtime_state(),
                 RuntimeState::Running | RuntimeState::Paused | RuntimeState::Starting
             ) {
@@ -263,18 +269,20 @@ fn handle_proxy_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
             } else {
                 Modal::ConfirmProxyStart
             };
+            ui.open_confirmation(modal);
         }
         KeyCode::Char('p') => toggle_pause(paths, ui),
         KeyCode::Char('c') => {
-            ui.modal = if ui.integration_enabled() {
+            let modal = if ui.integration_enabled() {
                 Modal::ConfirmIntegrationDisable
             } else {
                 Modal::ConfirmIntegrationEnable
             };
+            ui.open_confirmation(modal);
         }
         KeyCode::Char('a') => {
             if !ui.config.proxy.auto_switch {
-                ui.modal = Modal::ConfirmAutoSwitch;
+                ui.open_confirmation(Modal::ConfirmAutoSwitch);
             } else {
                 set_auto_switch(paths, ui, false);
             }
@@ -578,12 +586,25 @@ fn set_integration(paths: &Paths, ui: &mut Ui, enabled: bool) {
 }
 
 fn handle_modal(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
-    if key.code == KeyCode::Esc {
+    if key.code == KeyCode::Esc
+        || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
+    {
         if ui.modal == Modal::Onboarding {
             acknowledge_onboarding(paths, ui);
         }
         ui.modal = Modal::None;
-        ui.input.clear();
+        ui.editor.clear();
+        return Ok(false);
+    }
+    if ui.modal == Modal::Help {
+        handle_help_key(key, ui);
+        return Ok(false);
+    }
+    if ui.modal.is_confirmation() {
+        return handle_confirmation_key(key, paths, ui);
+    }
+    if ui.modal.is_text_editor() {
+        handle_editor_key(key, paths, ui);
         return Ok(false);
     }
     match ui.modal {
@@ -611,68 +632,13 @@ fn handle_modal(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
             }
             KeyCode::Char('3') => {
                 acknowledge_onboarding(paths, ui);
-                ui.modal = if ui.integration_enabled() {
+                let modal = if ui.integration_enabled() {
                     Modal::ConfirmIntegrationDisable
                 } else {
                     Modal::ConfirmIntegrationEnable
                 };
+                ui.open_confirmation(modal);
             }
-            _ => {}
-        },
-        Modal::Help if key.code == KeyCode::Char('q') => ui.modal = Modal::None,
-        Modal::ConfirmExit if key.code == KeyCode::Char('y') => return Ok(true),
-        Modal::ConfirmDelete if key.code == KeyCode::Char('y') => {
-            if let Some(index) = ui.selected_id() {
-                ui.notice = delete_account(&ui.config, &mut ui.index, paths, index)
-                    .unwrap_or_else(|error| error.to_string());
-                ui.selected = ui.selected.saturating_sub(1);
-            }
-            ui.modal = Modal::None;
-        }
-        Modal::ConfirmUseEmail if key.code == KeyCode::Char('y') => {
-            if let Some(index) = ui.selected_id()
-                && let Some(email) = ui.index.accounts[index].email.clone()
-            {
-                ui.notice = rename_account(&mut ui.index, paths, index, email)
-                    .unwrap_or_else(|error| error.to_string());
-            }
-            ui.modal = Modal::None;
-        }
-        Modal::ConfirmUseEmail if key.code == KeyCode::Char('n') => {
-            if let Some(index) = ui.selected_id() {
-                ui.input.clone_from(&ui.index.accounts[index].label);
-                ui.modal = Modal::Rename;
-            }
-        }
-        Modal::ConfirmProxyStart if key.code == KeyCode::Char('y') => {
-            ui.modal = Modal::None;
-            start_proxy(paths, ui);
-        }
-        Modal::ConfirmProxyStop if key.code == KeyCode::Char('y') => {
-            ui.modal = Modal::None;
-            stop_proxy(paths, ui);
-        }
-        Modal::ConfirmAutoSwitch if key.code == KeyCode::Char('y') => {
-            ui.modal = Modal::None;
-            set_auto_switch(paths, ui, true);
-        }
-        Modal::ConfirmIntegrationEnable if key.code == KeyCode::Char('y') => {
-            ui.modal = Modal::None;
-            set_integration(paths, ui, true);
-        }
-        Modal::ConfirmIntegrationDisable if key.code == KeyCode::Char('y') => {
-            ui.modal = Modal::None;
-            set_integration(paths, ui, false);
-        }
-        Modal::Import | Modal::Filter | Modal::Rename | Modal::Settings => match key.code {
-            KeyCode::Enter => {
-                finish_text_modal(paths, ui);
-                ui.input.clear();
-            }
-            KeyCode::Backspace => {
-                ui.input.pop();
-            }
-            KeyCode::Char(character) => ui.input.push(character),
             _ => {}
         },
         _ => {}
@@ -680,17 +646,147 @@ fn handle_modal(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
     Ok(false)
 }
 
-fn finish_text_modal(paths: &Paths, ui: &mut Ui) {
-    ui.notice = match ui.modal {
+fn handle_help_key(key: KeyEvent, ui: &mut Ui) {
+    let mut page = None;
+    match key.code {
+        KeyCode::Char('q') => ui.modal = Modal::None,
+        KeyCode::Char('1') => page = Some(HelpPage::QuickStart),
+        KeyCode::Char('2') => page = Some(HelpPage::Account),
+        KeyCode::Char('3') => page = Some(HelpPage::Proxy),
+        KeyCode::Char('4') => page = Some(HelpPage::Safety),
+        KeyCode::Tab => page = Some(ui.help_page.next()),
+        KeyCode::BackTab => page = Some(ui.help_page.previous()),
+        KeyCode::Char('j') | KeyCode::Down => {
+            ui.help_scroll = (ui.help_scroll + 1).min(ui.help_page.max_scroll())
+        }
+        KeyCode::Char('k') | KeyCode::Up => ui.help_scroll = ui.help_scroll.saturating_sub(1),
+        KeyCode::PageDown => ui.help_scroll = (ui.help_scroll + 6).min(ui.help_page.max_scroll()),
+        KeyCode::PageUp => ui.help_scroll = ui.help_scroll.saturating_sub(6),
+        KeyCode::Home => ui.help_scroll = 0,
+        KeyCode::End => ui.help_scroll = ui.help_page.max_scroll(),
+        _ => {}
+    }
+    if let Some(page) = page {
+        ui.help_page = page;
+        ui.help_scroll = 0;
+    }
+}
+
+fn handle_confirmation_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
+    match key.code {
+        KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+            ui.confirm_choice.toggle();
+            Ok(false)
+        }
+        KeyCode::Char('y') => execute_confirmation(paths, ui, true),
+        KeyCode::Char('n') => execute_confirmation(paths, ui, false),
+        KeyCode::Enter => execute_confirmation(
+            paths,
+            ui,
+            ui.confirm_choice == super::ConfirmChoice::Confirm,
+        ),
+        _ => Ok(false),
+    }
+}
+
+fn execute_confirmation(paths: &Paths, ui: &mut Ui, confirmed: bool) -> Result<bool> {
+    let modal = ui.modal;
+    ui.modal = Modal::None;
+    if !confirmed {
+        if modal == Modal::ConfirmUseEmail
+            && let Some(index) = ui.selected_id()
+        {
+            let value = ui.index.accounts[index].label.clone();
+            ui.open_text_editor(Modal::Rename, value);
+            refresh_completions(ui);
+        }
+        return Ok(false);
+    }
+    match modal {
+        Modal::ConfirmExit => return Ok(true),
+        Modal::ConfirmDelete => {
+            if let Some(index) = ui.selected_id() {
+                ui.notice = delete_account(&ui.config, &mut ui.index, paths, index)
+                    .unwrap_or_else(|error| error.to_string());
+                ui.selected = ui.selected.saturating_sub(1);
+            }
+        }
+        Modal::ConfirmUseEmail => {
+            if let Some(index) = ui.selected_id()
+                && let Some(email) = ui.index.accounts[index].email.clone()
+            {
+                ui.notice = rename_account(&mut ui.index, paths, index, email)
+                    .unwrap_or_else(|error| error.to_string());
+            }
+        }
+        Modal::ConfirmProxyStart => start_proxy(paths, ui),
+        Modal::ConfirmProxyStop => stop_proxy(paths, ui),
+        Modal::ConfirmAutoSwitch => set_auto_switch(paths, ui, true),
+        Modal::ConfirmIntegrationEnable => set_integration(paths, ui, true),
+        Modal::ConfirmIntegrationDisable => set_integration(paths, ui, false),
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_editor_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let text_changed = if control {
+        match key.code {
+            KeyCode::Char('a') => ui.editor.cursor = 0,
+            KeyCode::Char('e') => ui.editor.cursor = ui.editor.value.len(),
+            KeyCode::Char('n') => ui.editor.next_suggestion(),
+            KeyCode::Char('p') => ui.editor.previous_suggestion(),
+            KeyCode::Char('w') => ui.editor.delete_previous_word(),
+            KeyCode::Char('u') => ui.editor.kill_before_cursor(),
+            KeyCode::Char('k') => ui.editor.kill_after_cursor(),
+            _ => {}
+        }
+        matches!(key.code, KeyCode::Char('w' | 'u' | 'k'))
+    } else {
+        match key.code {
+            KeyCode::Enter => {
+                submit_text_editor(paths, ui);
+                return;
+            }
+            KeyCode::Left => ui.editor.move_left(),
+            KeyCode::Right => ui.editor.move_right(),
+            KeyCode::Home => ui.editor.cursor = 0,
+            KeyCode::End => ui.editor.cursor = ui.editor.value.len(),
+            KeyCode::Backspace => ui.editor.backspace(),
+            KeyCode::Delete => ui.editor.delete(),
+            KeyCode::Up => ui.editor.previous_suggestion(),
+            KeyCode::Down => ui.editor.next_suggestion(),
+            KeyCode::Tab => {
+                ui.editor.accept_suggestion();
+                refresh_completions(ui);
+                return;
+            }
+            KeyCode::Char(character) => ui.editor.insert(character),
+            _ => {}
+        }
+        matches!(
+            key.code,
+            KeyCode::Backspace | KeyCode::Delete | KeyCode::Char(_)
+        )
+    };
+    if text_changed {
+        refresh_completions(ui);
+    }
+}
+
+fn submit_text_editor(paths: &Paths, ui: &mut Ui) {
+    let value = ui.editor.value.clone();
+    let result = match ui.modal {
         Modal::Import => {
-            if ui.input.trim_start().starts_with('{') {
-                import_from_json(&ui.config, &mut ui.index, paths, &ui.input, None)
+            if value.trim_start().starts_with('{') {
+                import_from_json(&ui.config, &mut ui.index, paths, &value, None)
             } else {
-                import_from_path(&ui.config, &mut ui.index, paths, ui.input.trim())
+                import_from_path(&ui.config, &mut ui.index, paths, value.trim())
             }
         }
         Modal::Filter => {
-            ui.filter.clone_from(&ui.input);
+            ui.filter.clone_from(&value);
             ui.selected = 0;
             Ok(if ui.filter.is_empty() {
                 "已清除过滤".into()
@@ -698,16 +794,17 @@ fn finish_text_modal(paths: &Paths, ui: &mut Ui) {
                 format!("正在过滤：{}", ui.filter)
             })
         }
-        Modal::Rename => {
-            let index = ui
-                .selected_id()
-                .ok_or_else(|| AppError::Message("账户不存在".into()));
-            index.and_then(|index| {
-                rename_account(&mut ui.index, paths, index, ui.input.trim().to_string())
-            })
+        Modal::Rename if value.trim().is_empty() => {
+            Err(AppError::Message("账户名称不能为空".into()))
         }
+        Modal::Rename => ui
+            .selected_id()
+            .ok_or_else(|| AppError::Message("账户不存在".into()))
+            .and_then(|index| {
+                rename_account(&mut ui.index, paths, index, value.trim().to_string())
+            }),
         Modal::Settings => {
-            let path = PathBuf::from(ui.input.trim());
+            let path = PathBuf::from(value.trim());
             if path.as_os_str().is_empty() {
                 Err(AppError::Message("路径不能为空".into()))
             } else {
@@ -723,9 +820,120 @@ fn finish_text_modal(paths: &Paths, ui: &mut Ui) {
             }
         }
         _ => Ok(String::new()),
+    };
+    match result {
+        Ok(notice) => {
+            ui.notice = notice;
+            ui.modal = Modal::None;
+            ui.editor.clear();
+        }
+        Err(error) => ui.editor.error = Some(error.to_string()),
     }
-    .unwrap_or_else(|error| error.to_string());
-    ui.modal = Modal::None;
+}
+
+fn refresh_completions(ui: &mut Ui) {
+    let suggestions = match ui.modal {
+        Modal::Import => path_suggestions(&ui.editor.value, false),
+        Modal::Settings => path_suggestions(&ui.editor.value, true),
+        Modal::Filter => account_suggestions(ui, true),
+        Modal::Rename => account_suggestions(ui, false),
+        _ => Vec::new(),
+    };
+    ui.editor.suggestions = suggestions;
+    ui.editor.suggestion_index = 0;
+}
+
+fn path_suggestions(input: &str, directories_only: bool) -> Vec<InputSuggestion> {
+    if input.trim_start().starts_with('{') {
+        return Vec::new();
+    }
+    let input_path = Path::new(input);
+    let ends_with_separator = input.ends_with(MAIN_SEPARATOR);
+    let (parent, prefix) = if ends_with_separator {
+        (input_path, "")
+    } else {
+        (
+            input_path.parent().unwrap_or_else(|| Path::new(".")),
+            input_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(""),
+        )
+    };
+    let show_hidden = prefix.starts_with('.');
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    let mut suggestions = entries
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(prefix) || (!show_hidden && name.starts_with('.')) {
+                return None;
+            }
+            let directory = entry.file_type().ok()?.is_dir();
+            if directories_only && !directory {
+                return None;
+            }
+            let mut value = entry.path().to_string_lossy().into_owned();
+            if directory && !value.ends_with(MAIN_SEPARATOR) {
+                value.push(MAIN_SEPARATOR);
+            }
+            Some(InputSuggestion {
+                display: format!("{}{}", name, if directory { "/" } else { "" }),
+                value,
+                directory,
+            })
+        })
+        .collect::<Vec<_>>();
+    suggestions.sort_by(|left, right| {
+        right.directory.cmp(&left.directory).then_with(|| {
+            left.display
+                .to_lowercase()
+                .cmp(&right.display.to_lowercase())
+        })
+    });
+    suggestions.truncate(50);
+    suggestions
+}
+
+fn account_suggestions(ui: &Ui, filtering: bool) -> Vec<InputSuggestion> {
+    let query = ui.editor.value.to_lowercase();
+    let mut seen = HashSet::new();
+    let mut suggestions = Vec::new();
+    if filtering {
+        for account in &ui.index.accounts {
+            for value in [Some(account.label.as_str()), account.email.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if (query.is_empty() || value.to_lowercase().contains(&query))
+                    && seen.insert(value.to_owned())
+                {
+                    suggestions.push(InputSuggestion {
+                        display: value.to_owned(),
+                        value: value.to_owned(),
+                        directory: false,
+                    });
+                }
+            }
+        }
+    } else if let Some(index) = ui.selected_id() {
+        let account = &ui.index.accounts[index];
+        for value in [Some(account.label.as_str()), account.email.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if seen.insert(value.to_owned()) {
+                suggestions.push(InputSuggestion {
+                    display: value.to_owned(),
+                    value: value.to_owned(),
+                    directory: false,
+                });
+            }
+        }
+    }
+    suggestions
 }
 
 fn call_control(
@@ -816,14 +1024,78 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         ui.config.codex_home.clone_from(&original);
-        ui.modal = Modal::Settings;
-        ui.input = "'relative-and-shell-quoted/.codex'".into();
+        ui.open_text_editor(Modal::Settings, "'relative-and-shell-quoted/.codex'");
 
-        finish_text_modal(&paths, &mut ui);
+        submit_text_editor(&paths, &mut ui);
 
         assert_eq!(ui.config.codex_home, original);
-        assert!(ui.notice.contains("绝对路径"));
+        assert!(
+            ui.editor
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("绝对路径"))
+        );
+        assert_eq!(ui.modal, Modal::Settings);
         assert!(!paths.config_file.exists());
+    }
+
+    #[test]
+    fn enter_on_confirmation_uses_safe_default() {
+        let paths = test_paths();
+        let mut ui = ui();
+        ui.open_confirmation(Modal::ConfirmDelete);
+
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &paths,
+            &mut ui,
+        )
+        .unwrap();
+
+        assert_eq!(ui.modal, Modal::None);
+        assert!(ui.index.accounts.is_empty());
+    }
+
+    #[test]
+    fn help_center_supports_pages_and_keyboard_scrolling() {
+        let paths = test_paths();
+        let mut ui = ui();
+        ui.open_help();
+        handle_key(key('4'), &paths, &mut ui).unwrap();
+        assert_eq!(ui.help_page, HelpPage::Safety);
+        handle_key(key('j'), &paths, &mut ui).unwrap();
+        assert_eq!(ui.help_scroll, 1);
+        handle_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            &paths,
+            &mut ui,
+        )
+        .unwrap();
+        assert_eq!(ui.help_page, HelpPage::Proxy);
+        assert_eq!(ui.help_scroll, 0);
+    }
+
+    #[test]
+    fn path_completion_prioritizes_directories_and_hides_dotfiles() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-switcher-completion-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        std::fs::write(root.join("auth.json"), "{}").unwrap();
+        std::fs::write(root.join(".secret"), "hidden").unwrap();
+
+        let all = path_suggestions(&format!("{}/", root.display()), false);
+        assert_eq!(
+            all.first().map(|item| item.display.as_str()),
+            Some("folder/")
+        );
+        assert!(all.iter().any(|item| item.display == "auth.json"));
+        assert!(!all.iter().any(|item| item.display == ".secret"));
+
+        let directories = path_suggestions(&format!("{}/", root.display()), true);
+        assert_eq!(directories.len(), 1);
+        assert!(directories[0].directory);
     }
 
     #[test]

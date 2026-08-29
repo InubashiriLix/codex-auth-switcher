@@ -1,4 +1,4 @@
-use super::{DetailPage, Modal, ProxyPanel, Ui, Workspace};
+use super::{ConfirmChoice, DetailPage, HelpPage, Modal, ProxyPanel, Ui, Workspace};
 use crate::{
     proxy::RuntimeState,
     types::{Quota, StatusKind},
@@ -6,16 +6,14 @@ use crate::{
 use chrono::Local;
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Sparkline, Wrap,
     },
 };
-
-const ACCOUNT_HELP: &str = "账户管理\n\nj/k 选择账户    Enter 直接启用    r/R 检测\na 导入当前认证  i 导入 JSON/路径  n 重命名  d 删除\n/ 过滤           t 切换主题       m 切换工作区\n\nEsc 关闭详情/弹窗 · q 或 Ctrl-C 退出";
-const PROXY_HELP: &str = "代理控制台\n\nTab/Shift-Tab 循环面板 · 1/2/3/4 直达面板\nj/k 选择条目 · Enter 查看详情 · Space 管理代理池\ns 启停代理 · p 暂停/恢复 · c Codex 接入 · a 自动切换 · x 手动切换\nm 切换工作区 · Esc 关闭详情 · q 或 Ctrl-C 退出";
+use unicode_width::UnicodeWidthStr;
 
 pub fn draw(frame: &mut Frame, ui: &Ui) {
     let theme = ui.config.theme.colors();
@@ -1173,86 +1171,609 @@ fn draw_detail(
 }
 
 fn draw_modal(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
-    let (title, text, width, height) = match ui.modal {
-        Modal::Import => ("导入认证", ui.input.as_str(), 72, 34),
-        Modal::Filter => ("过滤账户", ui.input.as_str(), 60, 24),
-        Modal::Rename => ("重命名账户", ui.input.as_str(), 60, 24),
-        Modal::ConfirmUseEmail => (
-            "使用检测到的邮箱？",
-            "y 使用邮箱 · n 自定义名称 · Esc 取消",
-            60,
-            24,
-        ),
-        Modal::Settings => ("Codex 目录", ui.input.as_str(), 72, 24),
-        Modal::ConfirmDelete => ("确认删除账户", "按 y 永久删除账户快照；Esc 取消", 60, 24),
-        Modal::Help => (
-            "帮助",
-            if ui.workspace == Workspace::Proxy {
-                PROXY_HELP
-            } else {
-                ACCOUNT_HELP
-            },
-            74,
-            58,
-        ),
-        Modal::ModeSelector => (
+    match ui.modal {
+        Modal::Help => draw_help_center(frame, ui, theme),
+        modal if modal.is_text_editor() => draw_text_editor(frame, ui, theme),
+        modal if modal.is_confirmation() => draw_confirmation(frame, ui, theme),
+        Modal::ModeSelector => draw_choice_card(
+            frame,
+            theme,
             "切换工作区",
-            "1  ACCOUNT  账户管理\n\n2  PROXY    代理控制台\n\n按数字立即切换 · Esc 关闭",
-            52,
-            42,
+            &[
+                ("1", "ACCOUNT", "认证快照、额度检测与账户切换"),
+                ("2", "PROXY", "代理健康、账户池、实例与事件"),
+            ],
+            "按 1/2 立即进入  ·  Esc 返回",
         ),
-        Modal::ConfirmIntegrationEnable => (
-            "启用 Codex 接入",
-            "将备份并安全修改 $CODEX_HOME/config.toml。\n\n按 y 确认 · Esc 取消",
-            68,
-            32,
+        Modal::Onboarding => draw_choice_card(
+            frame,
+            theme,
+            "把代理跑起来",
+            &[
+                ("1", "准备账户", "检测后按 Space 明确加入代理池"),
+                ("2", "启动代理", "只监听本地回环地址"),
+                ("3", "接入 Codex", "备份并安全更新 config.toml"),
+            ],
+            "建议顺序 1 → 2 → 3  ·  ? 打开完整指南  ·  Esc 稍后再说",
         ),
-        Modal::ConfirmIntegrationDisable => (
-            "停用 Codex 接入",
-            "只恢复本工具管理的键；外部漂移时拒绝覆盖。\n\n按 y 确认 · Esc 取消",
-            68,
-            32,
-        ),
-        Modal::ConfirmProxyStart => (
-            "启动数据代理",
-            "将监听本地回环地址并开始路由请求。\n\n按 y 确认 · Esc 取消",
-            64,
-            30,
-        ),
-        Modal::ConfirmProxyStop => (
-            "停止代理并恢复 Codex",
-            "活动请求最多排空 30 秒，随后关闭 Codex 接入并恢复原配置；控制面仍可用。\n\n按 y 确认 · Esc 取消",
-            68,
-            32,
-        ),
-        Modal::ConfirmAutoSwitch => (
-            "首次启用自动切换",
-            "账户只会在安全请求边界切换，正在输出的 SSE 不会迁移。\n\n按 y 确认 · Esc 取消",
-            70,
-            34,
-        ),
-        Modal::ConfirmExit => (
-            "退出并停止内嵌代理",
-            "仍有活动请求。确认后停止接收新请求并最多排空 30 秒。\n\n按 y 确认退出 · Esc 取消",
-            70,
-            34,
-        ),
-        Modal::Onboarding => (
-            "首次设置代理",
-            "1  选择账户\n   检测账户，并在账户池按 Space 明确加入\n\n2  启动代理\n   至少一个新鲜健康账户入池后才能启动\n\n3  接入 Codex\n   使用 openai_base_url 接入，保留原 sessions\n\n按 1 前往账户池 · 2 启动 · 3 配置接入 · Esc 关闭",
-            78,
-            70,
-        ),
-        Modal::None => return,
-    };
-    let popup = centered(width, height, frame.area());
+        Modal::None => {}
+        _ => {}
+    }
+}
+
+fn draw_help_center(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
+    let popup = centered_fixed(104, 32, frame.area());
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .style(Style::default().fg(theme.text).bg(theme.surface))
-            .block(panel_block(theme, title, true)),
+        Block::default()
+            .title(Line::from(vec![
+                Span::styled(" ◈ ", Style::default().fg(theme.focus)),
+                Span::styled(
+                    "使用指南 ",
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("从第一个账户到稳定路由", Style::default().fg(theme.muted)),
+            ]))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.focus))
+            .style(Style::default().bg(theme.surface)),
         popup,
+    );
+    let inner = Rect::new(
+        popup.x + 2,
+        popup.y + 2,
+        popup.width.saturating_sub(4),
+        popup.height.saturating_sub(4),
+    );
+    let wide = inner.width >= 76;
+    let chunks = if wide {
+        Layout::horizontal([
+            Constraint::Length(22),
+            Constraint::Length(1),
+            Constraint::Min(20),
+        ])
+        .split(inner)
+    } else {
+        Layout::vertical([Constraint::Length(2), Constraint::Min(5)]).split(inner)
+    };
+    if wide {
+        let items = HelpPage::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, page)| {
+                let active = *page == ui.help_page;
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(" {} ", index + 1),
+                        Style::default()
+                            .fg(if active {
+                                theme.background
+                            } else {
+                                theme.focus
+                            })
+                            .bg(if active { theme.focus } else { theme.surface })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" {}", page.title()),
+                        Style::default()
+                            .fg(if active { theme.text } else { theme.muted })
+                            .add_modifier(if active {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(
+            List::new(items).block(
+                Block::default()
+                    .title("章 节")
+                    .borders(Borders::RIGHT)
+                    .border_style(Style::default().fg(theme.border)),
+            ),
+            chunks[0],
+        );
+    } else {
+        let tabs = HelpPage::ALL
+            .iter()
+            .enumerate()
+            .map(|(index, page)| {
+                let active = *page == ui.help_page;
+                Span::styled(
+                    format!(" {} {} ", index + 1, page.title()),
+                    Style::default()
+                        .fg(if active {
+                            theme.background
+                        } else {
+                            theme.muted
+                        })
+                        .bg(if active { theme.focus } else { theme.surface })
+                        .add_modifier(if active {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                )
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(Line::from(tabs)), chunks[0]);
+    }
+    let body_area = if wide { chunks[2] } else { chunks[1] };
+    let body = Paragraph::new(help_lines(ui.help_page, theme))
+        .scroll((ui.help_scroll, 0))
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(format!(
+                    "{}  ·  {}/4",
+                    ui.help_page.title(),
+                    ui.help_page as usize + 1
+                ))
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(theme.border)),
+        )
+        .style(Style::default().fg(theme.text));
+    frame.render_widget(body, body_area);
+    let footer = Rect::new(
+        inner.x,
+        popup.y + popup.height.saturating_sub(2),
+        inner.width,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new("Tab/Shift-Tab 翻页   1–4 直达   j/k 滚动   Home/End   Esc 关闭")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted)),
+        footer,
+    );
+}
+
+fn help_lines(page: HelpPage, theme: super::ThemeColors) -> Vec<Line<'static>> {
+    let heading = |text: &'static str| {
+        Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(theme.focus)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let key = |keys: &'static str, text: &'static str| {
+        Line::from(vec![
+            Span::styled(
+                format!(" {keys:^12} "),
+                Style::default()
+                    .fg(theme.background)
+                    .bg(theme.focus)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(text, Style::default().fg(theme.text)),
+        ])
+    };
+    match page {
+        HelpPage::QuickStart => vec![
+            heading("三步开始"),
+            Line::from(""),
+            key(
+                "1  ACCOUNT",
+                "a 导入当前 Codex 登录，或 i 从路径 / JSON 导入",
+            ),
+            Line::from("│   按 r 检测额度与认证状态"),
+            Line::from("│"),
+            key("2  PROXY", "m 切换工作区，在账户池按 Space 加入可路由账户"),
+            Line::from("│   按 s 启动本地代理，a 明确开启自动切换"),
+            Line::from("│"),
+            key("3  CODEX", "按 c 启用 Codex 接入，然后重启正在运行的 Codex"),
+            Line::from(""),
+            heading("你会看到什么"),
+            Line::from("• 顶栏始终显示工作区与 daemon 连接状态"),
+            Line::from("• PROXY 监控健康、流量、延迟、实例、路由与安全事件"),
+            Line::from("• 修改 Codex 接入后需重启 Codex，daemon 不受 TUI 退出影响"),
+        ],
+        HelpPage::Account => vec![
+            heading("ACCOUNT · 账户快照"),
+            Line::from("导入、检测、命名并切换 Codex 认证快照。"),
+            Line::from(""),
+            key("j / k", "下一个 / 上一个账户"),
+            key("Enter", "将选中快照设为当前 Codex 认证"),
+            key("a / i", "导入当前认证 / 导入 JSON 或文件路径"),
+            key("r / R", "检测选中账户 / 检测全部"),
+            key("n / d", "重命名 / 删除快照"),
+            key("/", "按名称或邮箱过滤；Esc 清除过滤"),
+            Line::from(""),
+            heading("输入框"),
+            Line::from("Tab 接受补全 · ↑/↓ 或 Ctrl-P/N 选补全 · Ctrl-A/E 到行首/行尾"),
+            Line::from("Ctrl-W 删除上一个词 · Ctrl-U/K 删除光标前/后内容"),
+        ],
+        HelpPage::Proxy => vec![
+            heading("PROXY · 本地路由控制台"),
+            Line::from(""),
+            key("Tab / S-Tab", "在控制、账户池、实例、事件之间循环"),
+            key("1 / 2 / 3 / 4", "直达对应面板"),
+            key("j / k", "选择条目；Enter 打开详情"),
+            key("Space", "在账户池中加入 / 移出代理资格"),
+            key("s / p", "启停代理 / 暂停或恢复路由"),
+            key("c / a", "Codex 接入 / 自动切换"),
+            key("x", "将选中账户设为下一安全边界的路由目标"),
+            Line::from(""),
+            heading("不会偷偷发生的事"),
+            Line::from("自动切换首次必须确认；未入池、未检测或已熔断的账户不参与路由。"),
+        ],
+        HelpPage::Safety => vec![
+            heading("路由与安全边界"),
+            Line::from(""),
+            key("粘性优先", "会话 → 进程与启动时间 → 连接，尽量保持账户稳定"),
+            key("安全切换", "只在尚未向 Codex 返回上游响应的请求边界切换"),
+            key(
+                "SSE",
+                "流已开始后绝不跨账户重放；中途断流记为 partial failure",
+            ),
+            key("无可用账户", "立即返回明确错误与最早恢复时间，不无限等待"),
+            Line::from(""),
+            heading("隐私红线"),
+            Line::from("只保留脱敏元数据；不记录提示词、代码、模型输出、Authorization 或 token。"),
+            Line::from("控制面仅绑定随机回环端口，并使用私有 runtime 文件中的 bearer token。"),
+        ],
+    }
+}
+
+fn draw_text_editor(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
+    let (title, hint, width) = match ui.modal {
+        Modal::Import => ("导入认证", "粘贴 JSON，或输入 auth.json 路径", 74),
+        Modal::Filter => ("过滤账户", "按名称或邮箱即时过滤", 58),
+        Modal::Rename => ("重命名账户", "使用一个容易辨认的名称", 58),
+        Modal::Settings => (
+            "Codex 目录",
+            "输入包含 config.toml 与 auth.json 的绝对路径",
+            74,
+        ),
+        _ => return,
+    };
+    let visible_suggestions = ui.editor.suggestions.len().min(5) as u16;
+    let height = 9 + visible_suggestions + u16::from(ui.editor.error.is_some());
+    let popup = centered_fixed(width, height, frame.area());
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .title(format!(" ✎  {title} "))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.focus))
+            .style(Style::default().bg(theme.surface)),
+        popup,
+    );
+    let inner = Rect::new(
+        popup.x + 2,
+        popup.y + 2,
+        popup.width.saturating_sub(4),
+        popup.height.saturating_sub(4),
+    );
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(theme.muted)),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    let input_area = Rect::new(inner.x, inner.y + 2, inner.width, 3);
+    let available = input_area.width.saturating_sub(3) as usize;
+    let (input, cursor_column) = visible_input(&ui.editor.value, ui.editor.cursor, available);
+    frame.render_widget(
+        Paragraph::new(input)
+            .style(Style::default().fg(theme.text))
+            .block(
+                Block::default()
+                    .title(" 输入 ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.focus)),
+            ),
+        input_area,
+    );
+    frame.set_cursor_position(Position::new(
+        input_area.x + 1 + cursor_column,
+        input_area.y + 1,
+    ));
+    let mut y = input_area.y + 3;
+    if visible_suggestions > 0 {
+        let start = ui.editor.suggestion_index.saturating_sub(4).min(
+            ui.editor
+                .suggestions
+                .len()
+                .saturating_sub(visible_suggestions as usize),
+        );
+        for (index, suggestion) in ui
+            .editor
+            .suggestions
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible_suggestions as usize)
+        {
+            let active = index == ui.editor.suggestion_index;
+            let marker = if suggestion.directory { "◇" } else { "•" };
+            frame.render_widget(
+                Paragraph::new(format!(
+                    " {} {marker} {}",
+                    if active { "›" } else { " " },
+                    suggestion.display
+                ))
+                .style(
+                    Style::default()
+                        .fg(if active {
+                            theme.selected_text
+                        } else {
+                            theme.muted
+                        })
+                        .bg(if active {
+                            theme.selected_bg
+                        } else {
+                            theme.surface
+                        }),
+                ),
+                Rect::new(inner.x, y, inner.width, 1),
+            );
+            y += 1;
+        }
+    }
+    if let Some(error) = &ui.editor.error {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "✕ ",
+                    Style::default()
+                        .fg(theme.error)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(error, Style::default().fg(theme.error)),
+            ]))
+            .wrap(Wrap { trim: true }),
+            Rect::new(inner.x, y, inner.width, 1),
+        );
+    }
+    let footer = Rect::new(
+        inner.x,
+        popup.y + popup.height.saturating_sub(2),
+        inner.width,
+        1,
+    );
+    frame.render_widget(
+        Paragraph::new("Enter 确认   Tab 补全   ↑/↓ 选择   Ctrl-A/E/W/U/K 编辑   Esc 取消")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted)),
+        footer,
+    );
+}
+
+fn visible_input(value: &str, cursor: usize, max_width: usize) -> (&str, u16) {
+    if max_width == 0 {
+        return ("", 0);
+    }
+    let mut start = cursor;
+    while start > 0 {
+        let previous = value[..start]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index);
+        if UnicodeWidthStr::width(&value[previous..cursor]) >= max_width {
+            break;
+        }
+        start = previous;
+    }
+    let mut end = cursor;
+    for (offset, character) in value[cursor..].char_indices() {
+        let next = cursor + offset + character.len_utf8();
+        if UnicodeWidthStr::width(&value[start..next]) > max_width {
+            break;
+        }
+        end = next;
+    }
+    (
+        &value[start..end],
+        UnicodeWidthStr::width(&value[start..cursor]) as u16,
+    )
+}
+
+fn draw_confirmation(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
+    let (title, detail, dangerous, cancel_label, confirm_label) = match ui.modal {
+        Modal::ConfirmUseEmail => (
+            "使用检测到的邮箱？",
+            "邮箱通常是最易辨认的账户名。",
+            false,
+            "自定义",
+            "使用邮箱",
+        ),
+        Modal::ConfirmDelete => (
+            "删除账户快照？",
+            "这会删除本地快照与索引记录，不会注销 OpenAI 账户。",
+            true,
+            "取消",
+            "删除",
+        ),
+        Modal::ConfirmIntegrationEnable => (
+            "启用 Codex 接入？",
+            "将先备份，再安全更新 $CODEX_HOME/config.toml。修改后需重启 Codex。",
+            false,
+            "取消",
+            "启用",
+        ),
+        Modal::ConfirmIntegrationDisable => (
+            "停用 Codex 接入？",
+            "只恢复本工具管理的键；发现外部配置漂移时会拒绝覆盖。",
+            false,
+            "取消",
+            "停用",
+        ),
+        Modal::ConfirmProxyStart => (
+            "启动本地代理？",
+            "将在 127.0.0.1 上启动流式路由，只使用已入池且健康的账户。",
+            false,
+            "取消",
+            "启动",
+        ),
+        Modal::ConfirmProxyStop => (
+            "停止代理并恢复 Codex？",
+            "停止接收新请求，活动请求最多排空 30 秒，然后恢复 Codex 配置。",
+            true,
+            "继续运行",
+            "停止",
+        ),
+        Modal::ConfirmAutoSwitch => (
+            "启用自动切换？",
+            "只在安全请求边界切换账户；已开始输出的 SSE 永不迁移。",
+            false,
+            "取消",
+            "启用",
+        ),
+        Modal::ConfirmExit => (
+            "退出并停止内嵌代理？",
+            "仍有活动请求。将停止接收新请求，并最多排空 30 秒。",
+            true,
+            "留在这里",
+            "退出",
+        ),
+        _ => return,
+    };
+    let accent = if dangerous {
+        theme.error
+    } else {
+        theme.warning
+    };
+    let popup = centered_fixed(66, 12, frame.area());
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .title(Line::from(vec![
+                Span::styled(
+                    if dangerous { " ⚠  " } else { " ◇  " },
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    title,
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+            ]))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent))
+            .style(Style::default().bg(theme.surface)),
+        popup,
+    );
+    let compact = popup.height < 10;
+    let body = Rect::new(
+        popup.x + 3,
+        popup.y + if compact { 2 } else { 3 },
+        popup.width.saturating_sub(6),
+        if compact { 2 } else { 3 },
+    );
+    frame.render_widget(
+        Paragraph::new(detail)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(theme.muted)),
+        body,
+    );
+    let button = |label: &str, selected: bool, color: Color| {
+        Span::styled(
+            format!("  {label}  "),
+            Style::default()
+                .fg(if selected { theme.background } else { color })
+                .bg(if selected { color } else { theme.surface })
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    let button_area = Rect::new(
+        popup.x + 3,
+        popup.y + popup.height.saturating_sub(4),
+        popup.width.saturating_sub(6),
+        1,
+    );
+    let button_areas = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(button_area);
+    frame.render_widget(
+        Paragraph::new(button(
+            cancel_label,
+            ui.confirm_choice == ConfirmChoice::Cancel,
+            theme.focus,
+        ))
+        .alignment(Alignment::Center),
+        button_areas[0],
+    );
+    frame.render_widget(
+        Paragraph::new(button(
+            confirm_label,
+            ui.confirm_choice == ConfirmChoice::Confirm,
+            accent,
+        ))
+        .alignment(Alignment::Center),
+        button_areas[1],
+    );
+    frame.render_widget(
+        Paragraph::new("←/→ 或 Tab 选择   Enter 执行   y/n 快捷键   Esc 取消")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted)),
+        Rect::new(
+            popup.x + 2,
+            popup.y + popup.height.saturating_sub(2),
+            popup.width.saturating_sub(4),
+            1,
+        ),
+    );
+}
+
+fn draw_choice_card(
+    frame: &mut Frame,
+    theme: super::ThemeColors,
+    title: &str,
+    choices: &[(&str, &str, &str)],
+    footer: &str,
+) {
+    let height = 7 + choices.len() as u16 * 2;
+    let popup = centered_fixed(72, height, frame.area());
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default()
+            .title(format!(" ◈  {title} "))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.focus))
+            .style(Style::default().bg(theme.surface)),
+        popup,
+    );
+    let mut lines = Vec::new();
+    for (key, name, detail) in choices {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {key} "),
+                Style::default()
+                    .fg(theme.background)
+                    .bg(theme.focus)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {name:<12}"),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(*detail, Style::default().fg(theme.muted)),
+        ]));
+        lines.push(Line::from(""));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Rect::new(
+            popup.x + 3,
+            popup.y + 2,
+            popup.width.saturating_sub(6),
+            popup.height.saturating_sub(4),
+        ),
+    );
+    frame.render_widget(
+        Paragraph::new(footer)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted)),
+        Rect::new(
+            popup.x + 2,
+            popup.y + popup.height.saturating_sub(2),
+            popup.width.saturating_sub(4),
+            1,
+        ),
     );
 }
 
@@ -1469,19 +1990,15 @@ fn active_account_id(ui: &Ui) -> Option<uuid::Uuid> {
         .map(|account| account.id)
 }
 
-fn centered(width: u16, height: u16, area: Rect) -> Rect {
-    let vertical = Layout::vertical([
-        Constraint::Percentage((100 - height) / 2),
-        Constraint::Percentage(height),
-        Constraint::Percentage((100 - height) / 2),
-    ])
-    .split(area);
-    Layout::horizontal([
-        Constraint::Percentage((100 - width) / 2),
-        Constraint::Percentage(width),
-        Constraint::Percentage((100 - width) / 2),
-    ])
-    .split(vertical[1])[1]
+fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width.saturating_sub(2)).max(1);
+    let height = height.min(area.height.saturating_sub(2)).max(1);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 #[cfg(test)]
@@ -1555,12 +2072,12 @@ mod tests {
         // whether this isolated renderer test shows onboarding.
         ui.modal = Modal::Onboarding;
         let onboarding = rendered_ui(120, 34, &ui);
-        assert!(onboarding.contains("首 次 设 置 代 理"), "{onboarding}");
+        assert!(onboarding.contains("把 代 理 跑 起 来"), "{onboarding}");
 
         ui.modal = Modal::ConfirmProxyStop;
         let confirmation = rendered_ui(120, 34, &ui);
         assert!(
-            confirmation.contains("停 止 代 理 并 恢 复"),
+            confirmation.contains("停 止 代 理 并 恢 复  Codex"),
             "{confirmation}"
         );
 
@@ -1569,6 +2086,56 @@ mod tests {
         let detail = rendered_ui(120, 34, &ui);
         assert!(detail.contains("代 理 控 制 详 情"), "{detail}");
         assert!(detail.contains("Esc 返 回"), "{detail}");
+    }
+
+    #[test]
+    fn help_center_has_four_real_pages_in_wide_and_small_terminals() {
+        let mut ui = Ui::new(
+            Config::defaults(),
+            AccountIndex::default(),
+            None,
+            Workspace::Accounts,
+        );
+        ui.modal = Modal::Help;
+        for (page, expected) in [
+            (HelpPage::QuickStart, "三 步 开 始"),
+            (HelpPage::Account, "账 户 快 照"),
+            (HelpPage::Proxy, "本 地 路 由 控 制 台"),
+            (HelpPage::Safety, "安 全 边 界"),
+        ] {
+            ui.help_page = page;
+            let screen = rendered_ui(110, 34, &ui);
+            assert!(screen.contains(expected), "{screen}");
+        }
+
+        ui.help_page = HelpPage::QuickStart;
+        let small = rendered_ui(48, 16, &ui);
+        assert!(small.contains("快 速 开 始"), "{small}");
+    }
+
+    #[test]
+    fn editor_and_confirmation_fit_small_terminals() {
+        let mut ui = Ui::new(
+            Config::defaults(),
+            AccountIndex::default(),
+            None,
+            Workspace::Accounts,
+        );
+        ui.open_text_editor(Modal::Settings, "/tmp/中文/.codex");
+        ui.editor.suggestions.push(super::super::InputSuggestion {
+            display: "codex/".into(),
+            value: "/tmp/codex/".into(),
+            directory: true,
+        });
+        ui.editor.error = Some("路径必须是绝对路径".into());
+        let editor = rendered_ui(48, 14, &ui);
+        assert!(editor.contains("Codex 目 录"), "{editor}");
+        assert!(editor.contains("绝 对 路 径"), "{editor}");
+
+        ui.open_confirmation(Modal::ConfirmDelete);
+        let confirmation = rendered_ui(40, 10, &ui);
+        assert!(confirmation.contains("取 消"), "{confirmation}");
+        assert!(confirmation.contains("删 除"), "{confirmation}");
     }
 
     #[test]

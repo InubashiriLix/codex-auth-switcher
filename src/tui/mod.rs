@@ -9,7 +9,8 @@ pub use draw::draw;
 pub use events::{handle_key, run_tui};
 pub use theme::ThemeColors;
 pub use ui::{
-    ActionUpdate, Checking, ControlUpdate, DetailPage, Modal, ProbeEvent, ProxyPanel, Ui, Workspace,
+    ActionUpdate, Checking, ConfirmChoice, ControlUpdate, DetailPage, HelpPage, InputSuggestion,
+    Modal, ProbeEvent, ProxyPanel, TextEditorState, Ui, Workspace,
 };
 
 use crate::{config::Config, proxy::ProxyState, types::AccountIndex};
