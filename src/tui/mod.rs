@@ -10,7 +10,7 @@ pub use events::{handle_key, run_tui};
 pub use theme::ThemeColors;
 pub use ui::{
     ActionUpdate, Checking, ConfirmChoice, ControlUpdate, DetailPage, HelpPage, InputSuggestion,
-    Modal, ProbeEvent, ProxyPanel, TextEditorState, Ui, Workspace,
+    Modal, ProbeEvent, ProxyPanel, RenderMode, SettingsGroup, TextEditorState, Ui, Workspace,
 };
 
 use crate::{config::Config, proxy::ProxyState, types::AccountIndex};
@@ -19,8 +19,15 @@ pub fn start_interactive(
     config: Config,
     index: AccountIndex,
     proxy_state: Option<ProxyState>,
+    force_tty_mode: bool,
 ) -> crate::Result<()> {
-    ui::run_interactive_tui(config, index, proxy_state, Workspace::Accounts)
+    ui::run_interactive_tui(
+        config,
+        index,
+        proxy_state,
+        Workspace::Accounts,
+        force_tty_mode,
+    )
 }
 
 pub fn start_interactive_in(
@@ -28,6 +35,7 @@ pub fn start_interactive_in(
     index: AccountIndex,
     proxy_state: Option<ProxyState>,
     workspace: Workspace,
+    force_tty_mode: bool,
 ) -> crate::Result<()> {
-    ui::run_interactive_tui(config, index, proxy_state, workspace)
+    ui::run_interactive_tui(config, index, proxy_state, workspace, force_tty_mode)
 }

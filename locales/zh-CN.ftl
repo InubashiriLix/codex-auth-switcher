@@ -175,6 +175,7 @@ cli-about = 支持代理的 Codex 认证管理器
 cli-proxy = 启用带 TUI 的代理模式
 cli-auto-switch = 在代理模式中启用自动切换
 cli-daemon = 以无界面后台守护进程运行
+cli-force-ascii = 强制交互式 TUI 使用纯 ASCII
 cli-daemon-status = 检查守护进程状态
 cli-daemon-stop = 安全停止守护进程
 cli-daemon-reload = 热重载守护进程配置

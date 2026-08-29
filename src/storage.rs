@@ -308,7 +308,18 @@ impl MetadataStore {
     pub fn metrics(&self, window_seconds: u64, bucket_seconds: u64) -> Result<MetricsWindow> {
         let window_seconds = window_seconds.clamp(10, 86_400);
         let bucket_seconds = bucket_seconds.clamp(1, window_seconds);
-        let cutoff = Utc::now() - Duration::seconds(window_seconds as i64);
+        // Anchor bucket boundaries to wall-clock bucket edges. A fresh query
+        // therefore updates the current bucket in place instead of shifting
+        // every chart column a little to the left on each TUI refresh.
+        let now = Utc::now();
+        let bucket_count = window_seconds.div_ceil(bucket_seconds) as usize;
+        let current_bucket =
+            now.timestamp().div_euclid(bucket_seconds as i64) * bucket_seconds as i64;
+        let cutoff = chrono::DateTime::from_timestamp(
+            current_bucket - (bucket_count.saturating_sub(1) as i64 * bucket_seconds as i64),
+            0,
+        )
+        .unwrap_or(now);
         let requests = {
             let connection = self.connection.lock();
             let mut statement = connection
@@ -345,7 +356,6 @@ impl MetadataStore {
         ttfb.sort_unstable();
         duration.sort_unstable();
 
-        let bucket_count = window_seconds.div_ceil(bucket_seconds) as usize;
         let mut buckets = (0..bucket_count)
             .map(|index| MetricBucket {
                 started_at: cutoff + Duration::seconds((index as u64 * bucket_seconds) as i64),

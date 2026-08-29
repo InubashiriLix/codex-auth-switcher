@@ -20,6 +20,10 @@ pub struct Cli {
     /// Run as background daemon (no TUI)
     #[arg(long, conflicts_with = "proxy")]
     pub daemon: bool,
+
+    /// Force the interactive TUI into its full Unicode/color presentation
+    #[arg(long, visible_alias = "force-ascii", conflicts_with = "daemon")]
+    pub force_tty_mode: bool,
 }
 
 #[derive(Subcommand)]
@@ -101,6 +105,9 @@ impl Cli {
             })
             .mut_arg("daemon", |arg| {
                 arg.help(translate(language, "cli-daemon", None))
+            })
+            .mut_arg("force_tty_mode", |arg| {
+                arg.help(translate(language, "cli-force-ascii", None))
             });
         for (name, key) in [
             ("daemon-status", "cli-daemon-status"),
@@ -185,5 +192,10 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn force_ascii_cannot_be_combined_with_the_headless_daemon() {
+        assert!(Cli::try_parse_from(["codex-switcher", "--force-ascii", "--daemon"]).is_err());
     }
 }

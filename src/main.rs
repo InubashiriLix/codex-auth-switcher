@@ -46,9 +46,9 @@ fn main() -> Result<()> {
             .unwrap()
             .block_on(async_main(cli, config, index, p))
     } else if cli.proxy {
-        run_proxy_tui(config, index, p)
+        run_proxy_tui(config, index, p, cli.force_tty_mode)
     } else {
-        codex_switcher::tui::start_interactive(config, index, None)
+        codex_switcher::tui::start_interactive(config, index, None, cli.force_tty_mode)
     }
 }
 
@@ -84,7 +84,12 @@ async fn async_main(cli: Cli, config: Config, index: AccountIndex, p: Paths) -> 
     }
 }
 
-fn run_proxy_tui(mut config: Config, index: AccountIndex, paths: Paths) -> Result<()> {
+fn run_proxy_tui(
+    mut config: Config,
+    index: AccountIndex,
+    paths: Paths,
+    force_tty_mode: bool,
+) -> Result<()> {
     // If the port belongs to our daemon, attach and leave it running when the
     // TUI exits. Otherwise create an embedded daemon and own its lifetime.
     let daemon_available = tokio::runtime::Runtime::new()
@@ -106,6 +111,7 @@ fn run_proxy_tui(mut config: Config, index: AccountIndex, paths: Paths) -> Resul
             index,
             None,
             codex_switcher::tui::Workspace::Proxy,
+            force_tty_mode,
         );
     }
     config.proxy.enabled = true;
@@ -138,6 +144,7 @@ fn run_proxy_tui(mut config: Config, index: AccountIndex, paths: Paths) -> Resul
             current_index,
             None,
             codex_switcher::tui::Workspace::Proxy,
+            force_tty_mode,
         ) {
             let _ = tokio::runtime::Runtime::new()?.block_on(control_request(
                 &paths,

@@ -16,6 +16,10 @@ theme = "midnight"
 # 界面语言：auto（跟随系统）、zh-cn、en、ja、es、de、it、fr
 language = "auto"
 
+# TUI 终端字符集："auto"（默认）、"unicode" 或 "ascii"
+# "auto" 在 TERM=dumb 或已知非 UTF-8 locale 时自动回退为 ASCII。
+terminal_mode = "auto"
+
 # 运行模式配置 / Operation Mode
 [mode]
 # 模式类型：interactive（交互式TUI）或 proxy_daemon（代理守护进程）

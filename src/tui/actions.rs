@@ -14,6 +14,25 @@ use std::{
     time::Duration,
 };
 
+/// Persist the account index and, when a daemon is running, make its in-memory
+/// index observe the same revision before the next snapshot is accepted.
+fn persist_index(paths: &Paths, index: &AccountIndex) -> Result<()> {
+    save_index(paths, index)?;
+    if matches!(
+        crate::daemon::check_daemon_status(paths)?,
+        crate::daemon::DaemonStatus::Running(_)
+    ) {
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(crate::daemon::control_request_json(
+            paths,
+            hyper::Method::POST,
+            "/v1/daemon/reload",
+            None,
+        ))?;
+    }
+    Ok(())
+}
+
 use super::{ActionUpdate, Checking, ControlUpdate, ProbeEvent, Ui};
 
 /// 导入当前Codex认证
@@ -22,8 +41,12 @@ pub fn import_current_auth(
     index: &mut AccountIndex,
     paths: &Paths,
 ) -> Result<String> {
+    let original = index.clone();
     import_current(config, index)?;
-    save_index(paths, index)?;
+    if let Err(error) = persist_index(paths, index) {
+        *index = original;
+        return Err(error);
+    }
     Ok(translate(
         config.language.resolve(),
         "notice-imported-current",
@@ -47,8 +70,12 @@ pub fn import_from_path(
         )));
     }
 
+    let original = index.clone();
     import_file(config, index, p)?;
-    save_index(paths, index)?;
+    if let Err(error) = persist_index(paths, index) {
+        *index = original;
+        return Err(error);
+    }
     Ok(translate_with(
         config.language.resolve(),
         "notice-imported-path",
@@ -72,8 +99,12 @@ pub fn import_from_json(
         ))
     })?;
 
+    let original = index.clone();
     import_value(config, index, value, "手动输入".into(), name)?;
-    save_index(paths, index)?;
+    if let Err(error) = persist_index(paths, index) {
+        *index = original;
+        return Err(error);
+    }
     Ok(translate(
         config.language.resolve(),
         "notice-imported-json",
@@ -99,10 +130,14 @@ pub fn rename_account(
     account_idx: usize,
     new_name: String,
 ) -> Result<String> {
+    let original = index.clone();
     if let Some(account) = index.accounts.get_mut(account_idx) {
         let old_name = account.label.clone();
         account.label = new_name.clone();
-        save_index(paths, index)?;
+        if let Err(error) = persist_index(paths, index) {
+            *index = original;
+            return Err(error);
+        }
         Ok(translate_with(
             config.language.resolve(),
             "notice-renamed",
@@ -125,7 +160,38 @@ pub fn delete_account(
     account_idx: usize,
 ) -> Result<String> {
     if account_idx < index.accounts.len() {
-        let account = index.accounts.remove(account_idx);
+        let account = index.accounts[account_idx].clone();
+        // If this is the active route, move it to another pool member before
+        // removing the profile so in-flight requests never retain a dead ID.
+        if let Ok(crate::daemon::DaemonStatus::Running(_)) =
+            crate::daemon::check_daemon_status(paths)
+            && let Ok(runtime) = tokio::runtime::Runtime::new()
+            && let Ok(value) = runtime.block_on(crate::daemon::control_request(
+                paths,
+                hyper::Method::GET,
+                "/v1/snapshot",
+            ))
+            && let Ok(snapshot) = serde_json::from_value::<crate::daemon::ControlSnapshot>(value)
+            && snapshot.current_account == Some(account.id)
+            && let Some(next) = index
+                .accounts
+                .iter()
+                .find(|candidate| candidate.id != account.id && candidate.proxy_enabled)
+        {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(crate::daemon::control_request_json(
+                paths,
+                hyper::Method::POST,
+                &format!("/v1/accounts/{}/switch", next.id),
+                None,
+            ))?;
+        }
+        let mut updated = index.clone();
+        updated.accounts.remove(account_idx);
+        // Commit the index first. A failed write/reload must not orphan the
+        // profile or leave the daemon with a contradictory account list.
+        persist_index(paths, &updated)?;
+        *index = updated;
 
         // 删除快照文件
         let snapshot_path = crate::account::snapshot_path(config, account.id);
@@ -133,7 +199,6 @@ pub fn delete_account(
             std::fs::remove_file(snapshot_path)?;
         }
 
-        save_index(paths, index)?;
         Ok(translate_with(
             config.language.resolve(),
             "notice-deleted",
@@ -155,10 +220,14 @@ pub fn probe_account(
     paths: &Paths,
     account_idx: usize,
 ) -> Result<String> {
+    let original = index.clone();
     if let Some(account) = index.accounts.get_mut(account_idx) {
         let label = account.label.clone();
         probe(config, account);
-        save_index(paths, index)?;
+        if let Err(error) = persist_index(paths, index) {
+            *index = original;
+            return Err(error);
+        }
         Ok(translate_with(
             config.language.resolve(),
             "notice-checked",
@@ -179,11 +248,15 @@ pub fn probe_all_accounts(
     index: &mut AccountIndex,
     paths: &Paths,
 ) -> Result<String> {
+    let original = index.clone();
     let count = index.accounts.len();
     for account in &mut index.accounts {
         probe(config, account);
     }
-    save_index(paths, index)?;
+    if let Err(error) = persist_index(paths, index) {
+        *index = original;
+        return Err(error);
+    }
     Ok(translate_with(
         config.language.resolve(),
         "notice-checked-all",
@@ -247,7 +320,10 @@ pub fn poll_probe(paths: &Paths, ui: &mut Ui) -> Result<()> {
                 ProbeEvent::Completed(account) => {
                     let account = *account;
                     if let Some(pos) = ui.index.accounts.iter().position(|a| a.id == account.id) {
-                        ui.index.accounts[pos] = account;
+                        // Probe workers may finish after a pool toggle or rename.
+                        // Merge only health fields and retain the current UI
+                        // identity/pool membership.
+                        ui.index.accounts[pos].status = account.status;
                     }
                     checking.completed += 1;
                 }
@@ -260,13 +336,38 @@ pub fn poll_probe(paths: &Paths, ui: &mut Ui) -> Result<()> {
     }
 
     if finished {
-        save_index(paths, &ui.index)?;
+        persist_index(paths, &ui.index)?;
         ui.notice = crate::i18n::translate_with(
             ui.language(),
             "notice-checked-all",
             [("count", total_count.to_string())],
         );
         ui.checking = None;
+        if ui.start_after_probe {
+            ui.start_after_probe = false;
+            if ui.attached_daemon && ui.eligible_accounts() > 0 {
+                let paths = paths.clone();
+                let sender = ui.action_sender.clone();
+                std::thread::spawn(move || {
+                    let result = tokio::runtime::Runtime::new()
+                        .map_err(AppError::from)
+                        .and_then(|runtime| {
+                            runtime.block_on(crate::daemon::control_request_json(
+                                &paths,
+                                hyper::Method::POST,
+                                "/v1/proxy/start",
+                                None,
+                            ))
+                        });
+                    let _ = sender.send(match result {
+                        Ok(_) => ActionUpdate::Success("Proxy 启动请求已发送".into()),
+                        Err(error) => ActionUpdate::Error(error.to_string()),
+                    });
+                });
+            } else if ui.attached_daemon {
+                ui.notice = ui.tr("notice-proxy-needs-pool");
+            }
+        }
     }
 
     Ok(())
@@ -377,7 +478,13 @@ pub fn poll_control_updates(ui: &mut Ui) {
                 let metrics_1m = *metrics_1m;
                 ui.attached_daemon = true;
                 if ui.checking.is_none() {
-                    ui.index.accounts.clone_from(&snapshot.accounts);
+                    if ui.pending_index_sync {
+                        if snapshot.accounts == ui.index.accounts {
+                            ui.pending_index_sync = false;
+                        }
+                    } else {
+                        ui.index.accounts.clone_from(&snapshot.accounts);
+                    }
                 }
                 let failures = snapshot.stats.failed_requests;
                 let ttfb = snapshot.stats.last_ttfb_ms.unwrap_or(0);
@@ -409,6 +516,7 @@ pub fn poll_control_updates(ui: &mut Ui) {
                     .iter()
                     .map(|bucket| bucket.ttfb_p95_ms.unwrap_or(0))
                     .collect();
+                ui.refresh_chart_axes();
                 ui.metrics = Some(metrics);
                 ui.metrics_1m = Some(metrics_1m);
                 if !ui.onboarding_checked {

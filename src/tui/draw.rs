@@ -1,4 +1,4 @@
-use super::{ConfirmChoice, DetailPage, HelpPage, Modal, ProxyPanel, Ui, Workspace};
+use super::{ConfirmChoice, DetailPage, HelpPage, Modal, ProxyPanel, SettingsGroup, Ui, Workspace};
 use crate::{
     i18n::{Language, LanguagePreference, translate_with},
     proxy::RuntimeState,
@@ -10,9 +10,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Sparkline, Wrap,
-    },
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -42,6 +40,9 @@ pub fn draw(frame: &mut Frame, ui: &Ui) {
     if ui.modal != Modal::None {
         draw_modal(frame, ui, theme);
     }
+    if ui.render_mode == super::RenderMode::Ascii {
+        sanitize_ascii_frame(frame);
+    }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors) {
@@ -69,13 +70,26 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors
         ),
     ];
     let language = Span::styled(
-        translate_with(
-            ui.language(),
-            "header-language",
-            [("language", ui.language().native_name())],
-        ),
+        if ui.render_mode == super::RenderMode::Ascii {
+            " [ASCII] EN ".into()
+        } else {
+            translate_with(
+                ui.language(),
+                "header-language",
+                [("language", ui.language().native_name())],
+            )
+        },
         Style::default().fg(theme.focus),
     );
+    if ui.forced_tty {
+        header.push(Span::styled(
+            " TTY+ ",
+            Style::default()
+                .fg(theme.background)
+                .bg(theme.focus)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if area.width < 72 {
         header.push(Span::raw(" "));
         header.push(language);
@@ -106,26 +120,101 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors) {
-    let keys = match ui.workspace {
-        Workspace::Accounts => ui.tr("footer-accounts"),
-        Workspace::Proxy => ui.tr("footer-proxy"),
+    let keys = if ui.render_mode == super::RenderMode::Ascii {
+        match ui.workspace {
+            Workspace::Accounts => {
+                "a Import  r/R Check  Enter Activate  / Filter  m Workspace  t Theme  ? Help".into()
+            }
+            Workspace::Proxy => {
+                "Tab/1-4 Panels  j/k Select  Enter Details  s Start/stop  p Pause  t Theme  ? Help"
+                    .into()
+            }
+        }
+    } else {
+        match ui.workspace {
+            Workspace::Accounts => ui.tr("footer-accounts"),
+            Workspace::Proxy => ui.tr("footer-proxy"),
+        }
     };
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .style(Style::default().fg(theme.border).bg(theme.background));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let columns = Layout::horizontal([Constraint::Min(1), Constraint::Length(12)]).split(inner);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(keys, Style::default().fg(theme.muted)),
             Span::styled(
                 format!("  │  {}", ui.notice),
-                Style::default().fg(theme.text),
+                Style::default().fg(notice_color(&ui.notice, theme)),
             ),
         ]))
-        .style(Style::default().bg(theme.background))
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .style(Style::default().fg(theme.border)),
-        ),
-        area,
+        .style(Style::default().bg(theme.background)),
+        columns[0],
     );
+    let active = ui.checking.is_some() || ui.start_after_probe;
+    let animation = scan_beam(
+        columns[1].width.saturating_sub(1) as usize,
+        ui.tick,
+        active,
+        theme,
+    );
+    frame.render_widget(
+        Paragraph::new(animation)
+            .alignment(Alignment::Right)
+            .style(Style::default().bg(theme.background)),
+        columns[1],
+    );
+}
+
+fn scan_beam(width: usize, tick: u64, active: bool, theme: super::ThemeColors) -> Line<'static> {
+    let width = width.clamp(6, 18);
+    let travel = width.saturating_sub(1).max(1);
+    let step = (tick / if active { 1 } else { 3 }) as usize;
+    let cycle = travel * 2;
+    let offset = step % cycle;
+    let center = if offset <= travel {
+        offset
+    } else {
+        cycle - offset
+    };
+    let spans = (0..width)
+        .map(|index| {
+            let distance = index.abs_diff(center);
+            let (symbol, color) = match distance {
+                0 => (
+                    "█",
+                    if active {
+                        theme.focus
+                    } else {
+                        theme.progress_fill
+                    },
+                ),
+                1 => ("▓", theme.progress_fill),
+                2 => ("▒", theme.progress_fill),
+                3 => ("░", theme.progress_track),
+                _ => ("─", theme.progress_track),
+            };
+            Span::styled(symbol.to_string(), Style::default().fg(color))
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
+}
+
+fn notice_color(notice: &str, theme: super::ThemeColors) -> Color {
+    let lower = notice.to_lowercase();
+    if lower.contains("error") || notice.contains("错误") || notice.contains("失败") {
+        theme.error
+    } else if lower.contains("warn") || notice.contains("警告") {
+        theme.warning
+    } else if notice.contains("完成") || notice.contains("成功") || lower.contains("success") {
+        theme.success
+    } else if notice.contains("检测") || notice.contains("启动") || lower.contains("start") {
+        theme.focus
+    } else {
+        theme.text
+    }
 }
 
 fn draw_accounts(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors) {
@@ -376,7 +465,7 @@ fn draw_proxy(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors)
         }
         return;
     }
-    let rows = Layout::vertical([Constraint::Length(7), Constraint::Min(8)]).split(area);
+    let rows = Layout::vertical([Constraint::Length(10), Constraint::Min(8)]).split(area);
     draw_proxy_metrics(frame, rows[0], ui, theme);
     let columns = Layout::horizontal([
         Constraint::Percentage(30),
@@ -480,20 +569,23 @@ fn draw_alert_strip(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeC
 
 fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors) {
     let columns = Layout::horizontal([
-        Constraint::Ratio(1, 6),
-        Constraint::Ratio(1, 6),
-        Constraint::Ratio(1, 6),
-        Constraint::Ratio(1, 6),
-        Constraint::Ratio(1, 6),
-        Constraint::Ratio(1, 6),
+        Constraint::Percentage(38),
+        Constraint::Percentage(31),
+        Constraint::Percentage(31),
     ])
     .split(area);
+    let cards = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(columns[0]);
+    let left_cards =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(cards[0]);
+    let right_cards =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(cards[1]);
     let stats = ui.snapshot.as_ref().map(|snapshot| &snapshot.stats);
     let runtime = ui.runtime_state();
     let (runtime_text, runtime_color) = runtime_label(ui, &runtime, theme);
     metric_card(
         frame,
-        columns[0],
+        left_cards[0],
         &ui.tr("data-proxy"),
         &runtime_text,
         &ui.config.proxy.listen_addr,
@@ -502,7 +594,7 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
     );
     metric_card(
         frame,
-        columns[1],
+        right_cards[0],
         &ui.tr("codex-integration"),
         if ui.integration_enabled() {
             "ON"
@@ -523,7 +615,7 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
     );
     metric_card(
         frame,
-        columns[2],
+        left_cards[1],
         &ui.tr("healthy-pool"),
         &ui.eligible_accounts().to_string(),
         &format!(
@@ -543,7 +635,7 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
     );
     metric_spark(
         frame,
-        columns[3],
+        columns[1],
         MetricSparkSpec {
             title: "RPS · 1 min",
             value: format!(
@@ -551,7 +643,7 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
                 ui.metrics_1m.as_ref().map_or(0.0, |metrics| metrics.rps)
             ),
             divisor: 1000.0,
-            minimum_max: 1000,
+            axis_max: ui.rps_axis_max,
             color: theme.focus,
         },
         &ui.request_history,
@@ -572,7 +664,7 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
     );
     metric_card(
         frame,
-        columns[4],
+        right_cards[1],
         &ui.tr("success-rate"),
         &format!("{success:.1}%"),
         &ui.tr("cumulative"),
@@ -585,7 +677,7 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
     );
     metric_spark(
         frame,
-        columns[5],
+        columns[2],
         MetricSparkSpec {
             title: "TTFB p95",
             value: format!(
@@ -597,7 +689,7 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
                     .unwrap_or(0)
             ),
             divisor: 1.0,
-            minimum_max: 100,
+            axis_max: ui.ttfb_axis_max,
             color: theme.warning,
         },
         &ui.ttfb_history,
@@ -606,6 +698,12 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
 }
 
 fn draw_control(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: super::ThemeColors) {
+    let sections = if area.height >= 20 {
+        Layout::vertical([Constraint::Min(10), Constraint::Length(7)]).split(area)
+    } else {
+        Layout::vertical([Constraint::Min(1), Constraint::Length(0)]).split(area)
+    };
+    let control_area = sections[0];
     let runtime = ui.runtime_state();
     let (runtime_text, runtime_color) = runtime_label(ui, &runtime, theme);
     let database = ui
@@ -708,6 +806,65 @@ fn draw_control(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: su
                 &format!("1  {}", ui.tr("control-alerts")),
                 focused,
             )),
+        control_area,
+    );
+    if area.height >= 20 {
+        draw_pool_brief(frame, sections[1], ui, theme);
+    }
+}
+
+fn draw_pool_brief(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors) {
+    let total = ui.index.accounts.len();
+    let joined = ui.index.accounts.iter().filter(|a| a.proxy_enabled).count();
+    let healthy = ui.eligible_accounts();
+    let current = ui
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.current_account)
+        .and_then(|id| ui.index.accounts.iter().find(|account| account.id == id))
+        .map(|account| account.label.as_str())
+        .unwrap_or("—");
+    let checking = ui.checking.as_ref().map_or_else(
+        || ui.tr("off"),
+        |checking| format!("{}/{}", checking.completed, checking.total),
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("{} {total}", ui.tr("accounts")),
+                    Style::default().fg(theme.text),
+                ),
+                Span::styled(
+                    format!("  {} {joined}", ui.tr("joined")),
+                    Style::default().fg(theme.focus),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(
+                    format!("{} {healthy}", ui.tr("healthy")),
+                    Style::default().fg(if healthy > 0 {
+                        theme.success
+                    } else {
+                        theme.error
+                    }),
+                ),
+                Span::styled(
+                    format!("  CHECK {checking}"),
+                    Style::default().fg(theme.muted),
+                ),
+            ]),
+            Line::from(Span::styled(
+                truncate_display(current, usize::from(area.width.saturating_sub(4))),
+                Style::default().fg(theme.focus),
+            )),
+        ])
+        .style(Style::default().bg(theme.surface))
+        .block(panel_block(
+            theme,
+            &format!("{} · BRIEF", ui.tr("account-pool")),
+            false,
+        )),
         area,
     );
 }
@@ -721,22 +878,25 @@ fn draw_pool(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: super
     // byte or character counts. Localized status names (for example French
     // "Disponible") otherwise shift the P/S quota columns on every row.
     let content_width = usize::from(area.width.saturating_sub(4));
-    let quota_width = if content_width >= 62 {
-        8
-    } else if content_width >= 48 {
-        6
+    // Reserve room for labels and the percentage, then let wide panels give
+    // the balances the extra space instead of truncating them at a fixed size.
+    let quota_width = content_width.saturating_sub(28).clamp(6, 36) / 2;
+    let status_width = 14;
+    let visible = ui.pool_visible();
+    let account_count = visible.len();
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    let add_spacing =
+        account_count > 1 && inner_height >= account_count.saturating_mul(4).saturating_sub(1);
+    let rail = if ui.render_mode == super::RenderMode::Ascii {
+        "|"
     } else {
-        4
+        "▌"
     };
-    let status_width = content_width
-        .saturating_sub(quota_width * 2 + 8)
-        .clamp(8, 12);
-    let items = ui
-        .index
-        .accounts
+    let items = visible
         .iter()
         .enumerate()
-        .map(|(position, account)| {
+        .map(|(position, index)| {
+            let account = &ui.index.accounts[*index];
             let selected = position == ui.pool_selected;
             let (status_color, status) = status_style(ui, theme, &account.status.kind);
             let runtime = ui.snapshot.as_ref().and_then(|snapshot| {
@@ -745,8 +905,10 @@ fn draw_pool(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: super
                     .iter()
                     .find(|runtime| runtime.account_id == account.id)
             });
-            let primary = mini_quota(account.status.primary.as_ref(), quota_width);
-            let secondary = mini_quota(account.status.secondary.as_ref(), quota_width);
+            let primary = quota_spans("P", account.status.primary.as_ref(), quota_width, theme);
+            let secondary = quota_spans("S", account.status.secondary.as_ref(), quota_width, theme);
+            let updated = format_last_update(account.status.checked_at, ui.language());
+            let next_reset = format_next_reset(account);
             let runtime_label = runtime.map_or_else(
                 || format!("0 {}", ui.tr("instances")),
                 |runtime| {
@@ -756,33 +918,34 @@ fn draw_pool(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: super
                     )
                 },
             );
-            let quota_line_width = 2 + status_width + 3 + quota_width + 3 + quota_width;
-            let show_runtime =
-                quota_line_width + 2 + display_width(&runtime_label) <= content_width;
-            let label_width =
-                content_width.saturating_sub(if current == Some(account.id) { 14 } else { 4 });
-            ListItem::new(vec![
+            let label_width = content_width.saturating_sub(14);
+            let is_current = current == Some(account.id);
+            let row_bg = if is_current {
+                theme.current_bg
+            } else if selected {
+                theme.selected_bg
+            } else {
+                theme.surface
+            };
+            let rail_color = if is_current {
+                theme.focus
+            } else if account.proxy_enabled {
+                theme.success
+            } else {
+                theme.muted
+            };
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled(
-                        if selected { "› " } else { "  " },
-                        Style::default().fg(theme.focus),
-                    ),
-                    Span::styled(
-                        if account.proxy_enabled {
-                            "● "
-                        } else {
-                            "○ "
-                        },
-                        Style::default().fg(if account.proxy_enabled {
-                            theme.success
-                        } else {
-                            theme.muted
-                        }),
+                        format!("{rail}{}", if selected { "›" } else { " " }),
+                        Style::default().fg(rail_color),
                     ),
                     Span::styled(
                         truncate_display(&account.label, label_width),
                         Style::default()
-                            .fg(if selected {
+                            .fg(if is_current {
+                                theme.current_text
+                            } else if selected {
                                 theme.selected_text
                             } else {
                                 theme.text
@@ -794,47 +957,43 @@ fn draw_pool(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: super
                             }),
                     ),
                     Span::styled(
-                        if current == Some(account.id) {
-                            "  ROUTING"
-                        } else {
-                            ""
-                        },
+                        if is_current { "  ROUTING" } else { "" },
                         Style::default().fg(theme.focus),
                     ),
-                ]),
-                Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(
-                        pad_display(&status, status_width),
+                ])
+                .style(Style::default().bg(row_bg)),
+                Line::from({
+                    let mut spans = vec![Span::styled(
+                        format!("{rail} "),
+                        Style::default().fg(rail_color),
+                    )];
+                    spans.extend(primary);
+                    spans.push(Span::styled("  S ", Style::default().fg(theme.muted)));
+                    spans.push(Span::styled(
+                        format!("{}  {}", pad_display(&status, status_width), updated),
                         Style::default().fg(status_color),
-                    ),
-                    Span::styled(
-                        format!("  P {primary}  S {secondary}"),
+                    ));
+                    spans
+                })
+                .style(Style::default().bg(row_bg)),
+                Line::from({
+                    let mut spans = vec![Span::styled(
+                        format!("{rail} "),
+                        Style::default().fg(rail_color),
+                    )];
+                    spans.extend(secondary);
+                    spans.push(Span::styled(
+                        format!("  {}  ↻ {}", runtime_label, next_reset),
                         Style::default().fg(theme.muted),
-                    ),
-                    Span::styled(
-                        if show_runtime {
-                            format!("  {runtime_label}")
-                        } else {
-                            String::new()
-                        },
-                        Style::default().fg(theme.muted),
-                    ),
-                ]),
-                Line::from(Span::styled(
-                    if show_runtime {
-                        String::new()
-                    } else {
-                        format!("  {runtime_label}")
-                    },
-                    Style::default().fg(theme.muted),
-                )),
-            ])
-            .style(Style::default().bg(if selected {
-                theme.selected_bg
-            } else {
-                theme.surface
-            }))
+                    ));
+                    spans
+                })
+                .style(Style::default().bg(row_bg)),
+            ];
+            if add_spacing && position + 1 < account_count {
+                lines.push(Line::from("").style(Style::default().bg(theme.surface)));
+            }
+            ListItem::new(lines)
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -1395,9 +1554,162 @@ fn draw_modal(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
             &ui.tr("onboarding-controls"),
         ),
         Modal::LanguageSelector => draw_language_selector(frame, ui, theme),
+        Modal::ConfigPage => draw_settings(frame, ui, theme),
         Modal::None => {}
         _ => {}
     }
+}
+
+fn draw_settings(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
+    let popup = centered_fixed(94, 22, frame.area());
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" ⚙ Settings ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.focus))
+        .style(Style::default().bg(theme.surface));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let cols = Layout::horizontal([
+        Constraint::Length(18),
+        Constraint::Length(38),
+        Constraint::Min(1),
+    ])
+    .split(inner);
+    let groups = ["General", "Proxy", "Storage"];
+    let group_items = groups
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            ListItem::new(Line::from(Span::styled(
+                format!(
+                    "{} {}",
+                    if i == ui.settings_group as usize {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    name
+                ),
+                Style::default().fg(if i == ui.settings_group as usize {
+                    theme.focus
+                } else {
+                    theme.muted
+                }),
+            )))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(group_items).block(panel_block(theme, "Groups", false)),
+        cols[0],
+    );
+    let fields: Vec<(&str, String, &str)> = match ui.settings_group {
+        SettingsGroup::General => vec![
+            (
+                "Theme",
+                format!("{:?}", ui.settings_draft.theme),
+                "Colors and contrast",
+            ),
+            (
+                "Language",
+                format!("{:?}", ui.settings_draft.language),
+                "Interface language",
+            ),
+            (
+                "Codex home",
+                ui.settings_draft.codex_home.display().to_string(),
+                "Authentication directory",
+            ),
+        ],
+        SettingsGroup::Proxy => vec![
+            (
+                "Listen address",
+                ui.settings_draft.proxy.listen_addr.clone(),
+                "Local loopback endpoint",
+            ),
+            (
+                "Auto switch",
+                ui.settings_draft.proxy.auto_switch.to_string(),
+                "Route requests automatically",
+            ),
+            (
+                "Threshold",
+                format!("{:.0}%", ui.settings_draft.proxy.threshold),
+                "Minimum remaining quota",
+            ),
+            (
+                "Strategy",
+                format!("{:?}", ui.settings_draft.proxy.strategy),
+                "Account selection strategy",
+            ),
+        ],
+        SettingsGroup::Storage => vec![
+            (
+                "Retention days",
+                ui.settings_draft.retention.days.to_string(),
+                "How long history is kept",
+            ),
+            (
+                "Max requests",
+                ui.settings_draft.retention.max_requests.to_string(),
+                "Request history cap",
+            ),
+            (
+                "Max events",
+                ui.settings_draft.retention.max_events.to_string(),
+                "Event history cap",
+            ),
+        ],
+    };
+    let query = ui.settings_query.to_lowercase();
+    let fields = fields
+        .into_iter()
+        .filter(|(name, value, help)| {
+            query.is_empty()
+                || format!("{name} {value} {help}")
+                    .to_lowercase()
+                    .contains(&query)
+        })
+        .collect::<Vec<_>>();
+    let field_items = fields
+        .iter()
+        .enumerate()
+        .map(|(i, (name, value, _))| {
+            ListItem::new(vec![Line::from(vec![
+                Span::styled(
+                    if i == ui.settings_selected {
+                        "› "
+                    } else {
+                        "  "
+                    },
+                    Style::default().fg(theme.focus),
+                ),
+                Span::styled(
+                    *name,
+                    Style::default()
+                        .fg(theme.text)
+                        .add_modifier(if i == ui.settings_selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(format!("  {value}"), Style::default().fg(theme.focus)),
+            ])])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(field_items).block(panel_block(theme, "Fields", false)),
+        cols[1],
+    );
+    let explanation = fields.get(ui.settings_selected).map(|(_, value, help)| format!("{help}\n\nCurrent value\n{value}\n\nEnter edit · Space toggle\nApply save · Esc cancel")).unwrap_or_else(|| "Select a setting".into());
+    frame.render_widget(
+        Paragraph::new(explanation)
+            .wrap(Wrap { trim: false })
+            .block(panel_block(theme, "Explanation", false))
+            .style(Style::default().fg(theme.muted)),
+        cols[2],
+    );
 }
 
 fn draw_language_selector(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
@@ -2087,7 +2399,7 @@ struct MetricSparkSpec<'a> {
     title: &'a str,
     value: String,
     divisor: f64,
-    minimum_max: u64,
+    axis_max: u64,
     color: Color,
 }
 
@@ -2114,35 +2426,98 @@ fn metric_spark(
         rows[0],
     );
     let data = history.iter().copied().collect::<Vec<_>>();
-    let axis_max = nice_axis_max(
-        data.iter()
-            .copied()
-            .max()
-            .unwrap_or(0)
-            .max(spec.minimum_max),
-    );
-    let plot = Layout::horizontal([Constraint::Length(6), Constraint::Min(1)]).split(rows[1]);
-    let midpoint = axis_max / 2;
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(format_axis(axis_max, spec.divisor)),
-            Line::from(format_axis(midpoint, spec.divisor)),
-            Line::from(""),
-            Line::from(format_axis(0, spec.divisor)),
-        ])
-        .alignment(Alignment::Right)
-        .style(Style::default().fg(theme.muted).bg(theme.surface)),
-        plot[0],
-    );
-    frame.render_widget(
-        Sparkline::default()
-            .data(&data)
-            .max(axis_max)
-            .style(Style::default().fg(spec.color).bg(theme.surface)),
-        plot[1],
+    let axis_max = spec.axis_max;
+    draw_metric_chart(
+        frame,
+        rows[1],
+        &data,
+        axis_max,
+        spec.divisor,
+        spec.color,
+        theme,
     );
 }
 
+/// Render axes and bars from one shared plot rectangle. The old Sparkline
+/// path chose a separate vertical origin, allowing the zero label and the bar
+/// baseline to diverge when the widget size changed.
+fn draw_metric_chart(
+    frame: &mut Frame,
+    area: Rect,
+    data: &[u64],
+    axis_max: u64,
+    divisor: f64,
+    color: Color,
+    theme: super::ThemeColors,
+) {
+    if area.width < 4 || area.height < 2 {
+        return;
+    }
+    let axis_width = 7.min(area.width.saturating_sub(1));
+    let plot = Rect::new(
+        area.x + axis_width,
+        area.y,
+        area.width.saturating_sub(axis_width),
+        area.height,
+    );
+    if plot.width == 0 || plot.height == 0 {
+        return;
+    }
+    let baseline = plot.bottom().saturating_sub(1);
+    let midpoint_y = plot.y + plot.height.saturating_sub(1) / 2;
+    let axis_x = plot.x.saturating_sub(1);
+    let mut labels = vec![
+        (plot.y, axis_max),
+        (midpoint_y, axis_max / 2),
+        (baseline, 0),
+    ];
+    labels.dedup_by_key(|(y, _)| *y);
+    for (y, value) in labels {
+        frame.render_widget(
+            Paragraph::new(format_axis(value, divisor))
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(theme.muted).bg(theme.surface)),
+            Rect::new(area.x, y, axis_width, 1),
+        );
+    }
+    let buffer = frame.buffer_mut();
+    for y in plot.y..plot.bottom() {
+        buffer[(axis_x, y)]
+            .set_symbol("|")
+            .set_style(Style::default().fg(theme.muted));
+    }
+    for x in axis_x..plot.right() {
+        buffer[(x, baseline)]
+            .set_symbol("-")
+            .set_style(Style::default().fg(theme.muted));
+    }
+    if data.is_empty() || plot.height < 2 {
+        return;
+    }
+    let visible = data.len().min(plot.width as usize);
+    let samples = &data[data.len() - visible..];
+    // Bucket slots span the full width. The latest bucket is always rightmost,
+    // so an in-progress bucket only changes height rather than drifting sideways.
+    for (index, value) in samples.iter().enumerate() {
+        let left = plot.x + (index as u16 * plot.width / visible as u16);
+        let right = (plot.x + ((index as u16 + 1) * plot.width / visible as u16))
+            .max(left.saturating_add(1))
+            .min(plot.right());
+        let height = value
+            .saturating_mul((plot.height.saturating_sub(1)) as u64)
+            .div_ceil(axis_max.max(1))
+            .min(plot.height.saturating_sub(1) as u64) as u16;
+        for y in baseline.saturating_sub(height)..baseline {
+            for x in left..right {
+                buffer[(x, y)]
+                    .set_symbol("█")
+                    .set_style(Style::default().fg(color).bg(theme.surface));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn nice_axis_max(value: u64) -> u64 {
     if value <= 1 {
         return 1;
@@ -2161,11 +2536,11 @@ fn nice_axis_max(value: u64) -> u64 {
 fn format_axis(value: u64, divisor: f64) -> String {
     let scaled = value as f64 / divisor;
     if scaled >= 100.0 || scaled.fract() == 0.0 {
-        format!("{scaled:.0} ┤")
+        format!("{scaled:.0} +")
     } else if scaled >= 10.0 {
-        format!("{scaled:.1} ┤")
+        format!("{scaled:.1} +")
     } else {
-        format!("{scaled:.2} ┤")
+        format!("{scaled:.2} +")
     }
 }
 
@@ -2216,13 +2591,76 @@ fn draw_quota(
     );
 }
 
-fn mini_quota(quota: Option<&Quota>, width: usize) -> String {
+fn quota_spans(
+    label: &str,
+    quota: Option<&Quota>,
+    width: usize,
+    theme: super::ThemeColors,
+) -> Vec<Span<'static>> {
     let Some(quota) = quota else {
-        return "·".repeat(width);
+        return vec![Span::styled(
+            format!("{label} [N/A]"),
+            Style::default().fg(theme.muted),
+        )];
     };
-    let filled =
-        (((100.0 - quota.used_percent).clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+    let remaining = (100.0 - quota.used_percent).clamp(0.0, 100.0);
+    let filled = ((remaining / 100.0) * width as f64).round() as usize;
+    let color = if remaining <= 10.0 {
+        theme.error
+    } else if remaining <= 25.0 {
+        theme.warning
+    } else {
+        theme.progress_fill
+    };
+    vec![
+        Span::styled(format!("{label} ["), Style::default().fg(theme.muted)),
+        Span::styled(
+            "█".repeat(filled),
+            Style::default().fg(color).bg(theme.progress_track),
+        ),
+        Span::styled(
+            "░".repeat(width - filled),
+            Style::default().fg(theme.progress_track),
+        ),
+        Span::styled(
+            format!("] {:>3.0}%", remaining),
+            Style::default().fg(theme.muted),
+        ),
+    ]
+}
+
+fn format_last_update(
+    checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    language: Language,
+) -> String {
+    let Some(checked_at) = checked_at else {
+        return "N/A".into();
+    };
+    let local = checked_at.with_timezone(&Local);
+    let age = chrono::Utc::now()
+        .signed_duration_since(checked_at)
+        .num_minutes()
+        .max(0);
+    let relative = match language {
+        Language::ZhCn => format!("{}分钟前", age),
+        Language::Ja => format!("{}分前", age),
+        _ => format!("{}m ago", age),
+    };
+    format!("{} · {}", relative, local.format("%H:%M"))
+}
+
+fn format_next_reset(account: &crate::types::Account) -> String {
+    account
+        .status
+        .primary
+        .iter()
+        .chain(account.status.secondary.iter())
+        .filter_map(|quota| quota.resets_at)
+        .filter_map(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
+        .filter(|time| *time > chrono::Utc::now())
+        .min()
+        .map(|time| time.with_timezone(&Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "N/A".into())
 }
 
 fn display_width(value: &str) -> usize {
@@ -2275,6 +2713,37 @@ fn panel_block<'a>(theme: super::ThemeColors, title: &'a str, focused: bool) -> 
                 }),
         )
         .style(Style::default().fg(theme.text).bg(theme.surface))
+}
+
+/// Final compatibility pass for legacy TTYs. Applying it to the finished
+/// buffer also covers dynamic account labels and messages that cannot be
+/// exhaustively normalized at each call site.
+fn sanitize_ascii_frame(frame: &mut Frame) {
+    for cell in &mut frame.buffer_mut().content {
+        let symbol = cell.symbol();
+        if symbol.is_ascii() {
+            continue;
+        }
+        let replacement = match symbol {
+            "─" | "━" | "═" | "▔" | "▁" => "-",
+            "│" | "┃" | "║" => "|",
+            "┌" | "┐" | "└" | "┘" | "├" | "┤" | "┬" | "┴" | "┼" | "╭" | "╮" | "╰" | "╯" | "╔"
+            | "╗" | "╚" | "╝" | "╠" | "╣" | "╦" | "╩" | "╬" => "+",
+            "█" | "▉" | "▊" | "▋" | "▌" | "▍" | "▎" | "▏" | "▇" | "▆" | "▅" | "▄" | "▃" | "▂" => {
+                "#"
+            }
+            "●" | "•" | "◇" | "✓" => "*",
+            "›" => ">",
+            "…" => ".",
+            "←" => "<",
+            "→" => ">",
+            "↑" => "^",
+            "↓" => "v",
+            "·" => ".",
+            _ => "?",
+        };
+        cell.set_symbol(replacement);
+    }
 }
 
 fn runtime_label(ui: &Ui, runtime: &RuntimeState, theme: super::ThemeColors) -> (String, Color) {
@@ -2344,13 +2813,14 @@ mod tests {
     use super::*;
     use crate::{
         config::Config,
-        types::{Account, AccountIndex, CheckStatus},
+        types::{Account, AccountIndex, CheckStatus, TerminalMode},
     };
     use ratatui::{Terminal, backend::TestBackend};
 
     fn test_config() -> Config {
         let mut config = Config::defaults();
         config.language = LanguagePreference::ZhCn;
+        config.terminal_mode = TerminalMode::Unicode;
         config
     }
 
@@ -2381,6 +2851,21 @@ mod tests {
         assert!(screen.contains("ACCOUNT"), "{screen}");
         assert!(screen.contains("账 户 列 表"), "{screen}");
         assert!(!screen.contains("总 览 实 例 账 户 池"), "{screen}");
+    }
+
+    #[test]
+    fn footer_scan_beam_moves_and_reverses_without_resetting() {
+        let theme = test_config().theme.colors();
+        let symbols = |tick| {
+            scan_beam(8, tick, true, theme)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert_ne!(symbols(0), symbols(1));
+        assert_eq!(symbols(0), symbols(14));
+        assert_eq!(symbols(6), symbols(8));
     }
 
     #[test]
@@ -2580,7 +3065,58 @@ mod tests {
         assert_eq!(nice_axis_max(0), 1);
         assert_eq!(nice_axis_max(37), 50);
         assert_eq!(nice_axis_max(101), 200);
-        assert_eq!(format_axis(500, 1000.0), "0.50 ┤");
+        assert_eq!(format_axis(500, 1000.0), "0.50 +");
+    }
+
+    #[test]
+    fn metric_chart_shares_the_zero_baseline_with_its_bars() {
+        let mut ui = Ui::new(
+            test_config(),
+            AccountIndex::default(),
+            None,
+            Workspace::Proxy,
+        );
+        ui.modal = Modal::None;
+        ui.request_history = [100, 500, 1_000].into_iter().collect();
+        ui.ttfb_history = [50, 200, 300].into_iter().collect();
+        ui.refresh_chart_axes();
+        let screen = rendered_ui(120, 30, &ui);
+        let baseline = screen
+            .lines()
+            .find(|line| line.matches("0 ----------------").count() == 2)
+            .expect("both charts share one zero-baseline row");
+        assert!(baseline.contains('-'), "{screen}");
+    }
+
+    #[test]
+    fn ascii_renderer_contains_no_unicode_even_for_dynamic_values() {
+        let mut config = test_config();
+        config.language = LanguagePreference::ZhCn;
+        let account = Account {
+            id: uuid::Uuid::new_v4(),
+            label: "测试账户".into(),
+            source: "导入".into(),
+            imported_at: chrono::Utc::now(),
+            email: Some("测试@example.com".into()),
+            plan: None,
+            account_id: None,
+            status: CheckStatus::default(),
+            tenant_id: "local".into(),
+            proxy_enabled: true,
+        };
+        let mut ui = Ui::new_with_render_mode(
+            config,
+            AccountIndex {
+                accounts: vec![account],
+            },
+            None,
+            Workspace::Proxy,
+            super::super::RenderMode::Ascii,
+        );
+        ui.modal = Modal::None;
+        let screen = rendered_ui(120, 30, &ui);
+        assert!(screen.is_ascii(), "{screen}");
+        assert!(screen.contains("[ASCII] EN"), "{screen}");
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crate::{
     error::*,
     i18n::LanguagePreference,
     paths::{Paths, user_home_dir},
-    types::Theme,
+    types::{TerminalMode, Theme},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,8 @@ pub struct Config {
     pub accounts_dir: PathBuf,
     #[serde(default)]
     pub theme: Theme,
+    #[serde(default)]
+    pub terminal_mode: TerminalMode,
     #[serde(default)]
     pub language: LanguagePreference,
     #[serde(default)]
@@ -49,6 +51,7 @@ impl Config {
                 .unwrap_or_else(|| home.join(".codex")),
             accounts_dir: data.join("codex-switcher").join("accounts"),
             theme: Theme::default(),
+            terminal_mode: TerminalMode::default(),
             language: LanguagePreference::default(),
             mode: OperationMode::Interactive,
             proxy: ProxyConfig::default(),
