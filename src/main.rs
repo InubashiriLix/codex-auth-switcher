@@ -1,3 +1,4 @@
+#[cfg(test)]
 use clap::Parser;
 use codex_switcher::{
     Paths,
@@ -8,19 +9,21 @@ use codex_switcher::{
         check_daemon_status, control_request, run_daemon, send_reload_signal, send_stop_signal,
     },
     error::Result,
+    i18n::{Language, LanguagePreference, translate},
     paths::paths,
     types::AccountIndex,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    init_tracing(terminal_logging_enabled(&cli));
     let p = paths();
+    let bootstrap_language = bootstrap_language(&p);
+    let cli = Cli::parse_localized(bootstrap_language);
+    init_tracing(terminal_logging_enabled(&cli));
 
     // 处理守护进程控制命令（同步）
     if let Some(command) = &cli.command {
-        return handle_daemon_command_sync(command, &p);
+        return handle_daemon_command_sync(command, &p, bootstrap_language);
     }
 
     let mut config = load_config(&p)?;
@@ -178,7 +181,7 @@ fn run_proxy_tui(mut config: Config, index: AccountIndex, paths: Paths) -> Resul
         .map_err(|_| codex_switcher::AppError::Message("内嵌代理线程异常退出".into()))?
 }
 
-fn handle_daemon_command_sync(command: &Commands, paths: &Paths) -> Result<()> {
+fn handle_daemon_command_sync(command: &Commands, paths: &Paths, language: Language) -> Result<()> {
     let call = |endpoint: &str| -> Result<serde_json::Value> {
         tokio::runtime::Runtime::new()?.block_on(control_request(
             paths,
@@ -194,30 +197,45 @@ fn handle_daemon_command_sync(command: &Commands, paths: &Paths) -> Result<()> {
                 "/v1/snapshot",
             )) {
                 Ok(snapshot) => println!(
-                    "守护进程状态: 运行中\n{}",
+                    "{}\n{}",
+                    translate(language, "cli-status-running", None),
                     serde_json::to_string_pretty(&snapshot)?
                 ),
-                Err(_) => println!("守护进程状态: {}", check_daemon_status(paths)?),
+                Err(_) => println!(
+                    "{}: {}",
+                    translate(language, "cli-status", None),
+                    check_daemon_status(paths)?
+                ),
             }
             Ok(())
         }
         Commands::DaemonStop => {
-            println!("正在停止守护进程...");
+            println!("{}", translate(language, "cli-stopping", None));
             if call("/v1/daemon/stop").is_err() {
                 send_stop_signal(paths)?;
             }
-            println!("停止信号已发送");
+            println!("{}", translate(language, "cli-stop-sent", None));
             Ok(())
         }
         Commands::DaemonReload => {
-            println!("正在热重载配置...");
+            println!("{}", translate(language, "cli-reloading", None));
             if call("/v1/daemon/reload").is_err() {
                 send_reload_signal(paths)?;
             }
-            println!("重载信号已发送");
+            println!("{}", translate(language, "cli-reload-sent", None));
             Ok(())
         }
     }
+}
+
+fn bootstrap_language(paths: &Paths) -> Language {
+    let preference = std::fs::read_to_string(&paths.config_file)
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Value>().ok())
+        .and_then(|value| value.get("language").cloned())
+        .and_then(|value| value.try_into::<LanguagePreference>().ok())
+        .unwrap_or_default();
+    preference.resolve()
 }
 
 #[cfg(test)]

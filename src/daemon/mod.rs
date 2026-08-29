@@ -149,6 +149,7 @@ impl DaemonState {
                 // 只更新可以安全热更新的部分
                 self.config.proxy = new_config.proxy.clone();
                 self.config.theme = new_config.theme;
+                self.config.language = new_config.language;
 
                 info!("Configuration reloaded");
             }
@@ -217,7 +218,12 @@ impl DaemonState {
         info!("Switched to account: {}", target.label);
 
         // 发送桌面通知
-        if let Err(e) = self.send_notification(&format!("已切换到账户: {}", target.label)) {
+        let message = crate::i18n::translate_with(
+            self.config.language.resolve(),
+            "notification-switched-to",
+            [("account", target.label.as_str())],
+        );
+        if let Err(e) = self.send_notification(&message) {
             warn!("Failed to send notification: {}", e);
         }
 
@@ -261,6 +267,7 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
         kind: "daemon_started".into(),
         account_id: None,
         detail: "代理守护进程已启动".into(),
+        message: Some(crate::i18n::LocalizedMessage::new("event-daemon-started")),
     });
     if let Some(notice) = recovery_notice {
         let _ = state.metadata_store.record_event(&RuntimeEvent {
@@ -272,6 +279,7 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
             kind: "config_recovered".into(),
             account_id: None,
             detail: crate::storage::sanitize(&notice),
+            message: Some(crate::i18n::LocalizedMessage::new("event-config-recovered")),
         });
     }
 

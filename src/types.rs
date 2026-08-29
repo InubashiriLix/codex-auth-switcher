@@ -85,10 +85,10 @@ pub enum Theme {
 impl Theme {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Midnight => "Midnight（深色高对比）",
-            Self::Nord => "Nord（冷色低饱和）",
-            Self::Gruvbox => "Gruvbox（暖色深色）",
-            Self::Paper => "Paper（浅色高对比）",
+            Self::Midnight => "Midnight",
+            Self::Nord => "Nord",
+            Self::Gruvbox => "Gruvbox",
+            Self::Paper => "Paper",
         }
     }
 

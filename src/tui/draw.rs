@@ -1,5 +1,6 @@
 use super::{ConfirmChoice, DetailPage, HelpPage, Modal, ProxyPanel, Ui, Workspace};
 use crate::{
+    i18n::{Language, LanguagePreference, translate_with},
     proxy::RuntimeState,
     types::{Quota, StatusKind},
 };
@@ -13,7 +14,7 @@ use ratatui::{
         Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Sparkline, Wrap,
     },
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn draw(frame: &mut Frame, ui: &Ui) {
     let theme = ui.config.theme.colors();
@@ -54,40 +55,60 @@ fn draw_header(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors
     } else {
         theme.focus
     };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " CODEX SWITCHER ",
-                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" {} ", ui.workspace.badge()),
-                Style::default()
-                    .fg(theme.background)
-                    .bg(badge_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
+    let mut header = vec![
+        Span::styled(
+            " CODEX SWITCHER ",
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {} ", ui.workspace.badge()),
+            Style::default()
+                .fg(theme.background)
+                .bg(badge_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let language = Span::styled(
+        translate_with(
+            ui.language(),
+            "header-language",
+            [("language", ui.language().native_name())],
+        ),
+        Style::default().fg(theme.focus),
+    );
+    if area.width < 72 {
+        header.push(Span::raw(" "));
+        header.push(language);
+    } else {
+        header.extend([
             daemon,
             Span::styled(
                 format!("   {}   ", ui.config.theme.name()),
                 Style::default().fg(theme.muted),
             ),
-            Span::styled("[m] 切换工作区", Style::default().fg(theme.focus)),
-        ]))
-        .style(Style::default().bg(theme.surface))
-        .block(
-            Block::default()
-                .borders(Borders::BOTTOM)
-                .style(Style::default().fg(theme.border).bg(theme.surface)),
-        ),
+            Span::styled(
+                format!("[m] {}   ", ui.tr("workspace-switch")),
+                Style::default().fg(theme.focus),
+            ),
+            language,
+        ]);
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(header))
+            .style(Style::default().bg(theme.surface))
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .style(Style::default().fg(theme.border).bg(theme.surface)),
+            ),
         area,
     );
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors) {
     let keys = match ui.workspace {
-        Workspace::Accounts => " a 导入  r/R 检测  Enter 启用  / 过滤  m 工作区  ? 帮助",
-        Workspace::Proxy => " Tab/1-4 面板  j/k 选择  Enter 详情  s 启停  p 暂停  c 接入  ? 帮助",
+        Workspace::Accounts => ui.tr("footer-accounts"),
+        Workspace::Proxy => ui.tr("footer-proxy"),
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -124,32 +145,32 @@ fn draw_accounts(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColo
         .count();
     let active = active_account_id(ui)
         .and_then(|id| ui.index.accounts.iter().find(|account| account.id == id))
-        .map(|account| account.label.as_str())
-        .unwrap_or("未设置");
+        .map(|account| account.label.clone())
+        .unwrap_or_else(|| ui.tr("not-set"));
     metric_card(
         frame,
         cards[0],
-        "账户",
+        &ui.tr("accounts"),
         &ui.index.accounts.len().to_string(),
-        "已保存",
+        &ui.tr("saved"),
         theme.focus,
         theme,
     );
     metric_card(
         frame,
         cards[1],
-        "健康",
+        &ui.tr("healthy"),
         &live.to_string(),
-        "可直接使用",
+        &ui.tr("ready-to-use"),
         theme.success,
         theme,
     );
     metric_card(
         frame,
         cards[2],
-        "待处理",
+        &ui.tr("needs-attention"),
         &ui.index.accounts.len().saturating_sub(live).to_string(),
-        "需要检测或登录",
+        &ui.tr("check-or-login"),
         if live == ui.index.accounts.len() {
             theme.muted
         } else {
@@ -160,8 +181,8 @@ fn draw_accounts(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColo
     metric_card(
         frame,
         cards[3],
-        "当前直连",
-        active,
+        &ui.tr("current-direct"),
+        &active,
         "auth.json",
         theme.focus,
         theme,
@@ -181,11 +202,11 @@ fn draw_account_list(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Theme
         .enumerate()
         .map(|(position, index)| {
             let account = &ui.index.accounts[*index];
-            let (color, status) = status_style(theme, &account.status.kind);
+            let (color, status) = status_style(ui, theme, &account.status.kind);
             let direct = if active == Some(account.id) {
-                "  ● 直连"
+                format!("  ● {}", ui.tr("direct"))
             } else {
-                ""
+                String::new()
             };
             ListItem::new(vec![
                 Line::from(vec![
@@ -217,7 +238,13 @@ fn draw_account_list(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Theme
                     Span::raw("  "),
                     Span::styled(status, Style::default().fg(color)),
                     Span::styled(
-                        format!("  {}", account.email.as_deref().unwrap_or("邮箱未知")),
+                        format!(
+                            "  {}",
+                            account
+                                .email
+                                .clone()
+                                .unwrap_or_else(|| ui.tr("email-unknown"))
+                        ),
                         Style::default().fg(theme.muted),
                     ),
                 ]),
@@ -229,16 +256,13 @@ fn draw_account_list(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Theme
             }))
         })
         .collect::<Vec<_>>();
+    let title = if ui.filter.is_empty() {
+        ui.tr("account-list")
+    } else {
+        ui.tr("filter-results")
+    };
     frame.render_widget(
-        List::new(items).block(panel_block(
-            theme,
-            if ui.filter.is_empty() {
-                "账户列表"
-            } else {
-                "过滤结果"
-            },
-            true,
-        )),
+        List::new(items).block(panel_block(theme, &title, true)),
         area,
     );
 }
@@ -246,10 +270,10 @@ fn draw_account_list(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Theme
 fn draw_account_summary(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors) {
     let Some(index) = ui.selected_id() else {
         frame.render_widget(
-            Paragraph::new("暂无账户\n\n按 a 导入当前 Codex 登录，或按 i 导入 JSON/路径。")
+            Paragraph::new(ui.tr("no-accounts").replace("\\n", "\n"))
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(theme.muted).bg(theme.surface))
-                .block(panel_block(theme, "账户详情", false)),
+                .block(panel_block(theme, &ui.tr("account-details"), false)),
             area,
         );
         return;
@@ -262,7 +286,7 @@ fn draw_account_summary(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Th
         Constraint::Min(4),
     ])
     .split(area);
-    let (color, status) = status_style(theme, &account.status.kind);
+    let (color, status) = status_style(ui, theme, &account.status.kind);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
@@ -272,32 +296,41 @@ fn draw_account_summary(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Th
             Line::from(vec![
                 Span::styled(status, Style::default().fg(color)),
                 Span::styled(
-                    format!("   {}", account.plan.as_deref().unwrap_or("套餐未知")),
+                    format!(
+                        "   {}",
+                        account
+                            .plan
+                            .clone()
+                            .unwrap_or_else(|| ui.tr("plan-unknown"))
+                    ),
                     Style::default().fg(theme.muted),
                 ),
             ]),
             Line::from(format!(
-                "邮箱  {}",
-                account.email.as_deref().unwrap_or("未知")
+                "{}  {}",
+                ui.tr("email"),
+                account.email.clone().unwrap_or_else(|| ui.tr("unknown"))
             )),
-            Line::from(format!("来源  {}", account.source)),
+            Line::from(format!("{}  {}", ui.tr("source"), account.source)),
         ])
         .style(Style::default().fg(theme.text).bg(theme.surface))
-        .block(panel_block(theme, "身份与状态", false)),
+        .block(panel_block(theme, &ui.tr("identity-status"), false)),
         parts[0],
     );
     draw_quota(
         frame,
         parts[1],
-        "主要额度窗口",
+        &ui.tr("primary-quota"),
         account.status.primary.as_ref(),
+        ui,
         theme,
     );
     draw_quota(
         frame,
         parts[2],
-        "次要额度窗口",
+        &ui.tr("secondary-quota"),
         account.status.secondary.as_ref(),
+        ui,
         theme,
     );
     let checked = account
@@ -308,15 +341,19 @@ fn draw_account_summary(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Th
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string()
         })
-        .unwrap_or_else(|| "从未检测".into());
+        .unwrap_or_else(|| ui.tr("never-checked"));
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(format!("最近检测  {checked}")),
-            Line::from(format!("状态说明  {}", account.status.detail)),
+            Line::from(format!("{}  {checked}", ui.tr("last-check"))),
+            Line::from(format!(
+                "{}  {}",
+                ui.tr("status-detail"),
+                account.status.detail
+            )),
         ])
         .wrap(Wrap { trim: false })
         .style(Style::default().fg(theme.muted).bg(theme.surface))
-        .block(panel_block(theme, "诊断", false)),
+        .block(panel_block(theme, &ui.tr("diagnostics"), false)),
         parts[3],
     );
 }
@@ -380,7 +417,7 @@ fn draw_proxy(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors)
 }
 
 fn draw_compact_proxy_status(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors) {
-    let (runtime, color) = runtime_label(&ui.runtime_state(), theme);
+    let (runtime, color) = runtime_label(ui, &ui.runtime_state(), theme);
     let active = ui
         .snapshot
         .as_ref()
@@ -396,24 +433,27 @@ fn draw_compact_proxy_status(frame: &mut Frame, area: Rect, ui: &Ui, theme: supe
             ),
             Span::styled(
                 format!(
-                    "  接入 {}  健康池 {}  活动 {}  ",
+                    "  {} {}  {} {}  {} {}  ",
+                    ui.tr("integration"),
                     if ui.integration_enabled() {
                         "ON"
                     } else {
                         "OFF"
                     },
+                    ui.tr("healthy-pool"),
                     ui.eligible_accounts(),
+                    ui.tr("active"),
                     active
                 ),
                 Style::default().fg(theme.text),
             ),
             Span::styled(
-                format!("面板 {}", ui.proxy_panel.number()),
+                format!("{} {}", ui.tr("panel"), ui.proxy_panel.number()),
                 Style::default().fg(theme.focus),
             ),
         ]))
         .style(Style::default().bg(theme.surface))
-        .block(panel_block(theme, "代理状态", false)),
+        .block(panel_block(theme, &ui.tr("proxy-status"), false)),
         area,
     );
 }
@@ -424,7 +464,7 @@ fn draw_alert_strip(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeC
         .as_ref()
         .and_then(|snapshot| snapshot.alerts.first());
     let (text, color) = alert.map_or_else(
-        || (" ✓ 当前无告警".to_string(), theme.success),
+        || (format!(" ✓ {}", ui.tr("no-alerts")), theme.success),
         |alert| {
             (
                 format!(" ! {} · {}", alert.title, alert.detail),
@@ -450,12 +490,12 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
     .split(area);
     let stats = ui.snapshot.as_ref().map(|snapshot| &snapshot.stats);
     let runtime = ui.runtime_state();
-    let (runtime_text, runtime_color) = runtime_label(&runtime, theme);
+    let (runtime_text, runtime_color) = runtime_label(ui, &runtime, theme);
     metric_card(
         frame,
         columns[0],
-        "数据代理",
-        runtime_text,
+        &ui.tr("data-proxy"),
+        &runtime_text,
         &ui.config.proxy.listen_addr,
         runtime_color,
         theme,
@@ -463,7 +503,7 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
     metric_card(
         frame,
         columns[1],
-        "Codex 接入",
+        &ui.tr("codex-integration"),
         if ui.integration_enabled() {
             "ON"
         } else {
@@ -484,13 +524,15 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
     metric_card(
         frame,
         columns[2],
-        "健康池",
+        &ui.tr("healthy-pool"),
         &ui.eligible_accounts().to_string(),
         &format!(
-            "可路由 · {} 活动请求",
+            "{} · {} {}",
+            ui.tr("routable"),
             ui.snapshot
                 .as_ref()
-                .map_or(0, |snapshot| snapshot.active_requests.len())
+                .map_or(0, |snapshot| snapshot.active_requests.len()),
+            ui.tr("active-requests")
         ),
         if ui.eligible_accounts() > 0 {
             theme.success
@@ -531,9 +573,9 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
     metric_card(
         frame,
         columns[4],
-        "成功率",
+        &ui.tr("success-rate"),
         &format!("{success:.1}%"),
-        "累计",
+        &ui.tr("cumulative"),
         if success >= 95.0 {
             theme.success
         } else {
@@ -565,15 +607,18 @@ fn draw_proxy_metrics(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::Them
 
 fn draw_control(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: super::ThemeColors) {
     let runtime = ui.runtime_state();
-    let (runtime_text, runtime_color) = runtime_label(&runtime, theme);
+    let (runtime_text, runtime_color) = runtime_label(ui, &runtime, theme);
     let database = ui
         .snapshot
         .as_ref()
-        .map(|snapshot| snapshot.health.database.as_str())
-        .unwrap_or("未连接");
+        .map(|snapshot| snapshot.health.database.clone())
+        .unwrap_or_else(|| ui.tr("disconnected"));
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("状态     ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{}     ", ui.tr("status")),
+                Style::default().fg(theme.muted),
+            ),
             Span::styled(
                 runtime_text,
                 Style::default()
@@ -581,48 +626,63 @@ fn draw_control(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: su
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(format!("监听     {}", ui.config.proxy.listen_addr)),
         Line::from(format!(
-            "接入     {}",
+            "{}     {}",
+            ui.tr("listening"),
+            ui.config.proxy.listen_addr
+        )),
+        Line::from(format!(
+            "{}     {}",
+            ui.tr("integration"),
             if ui.integration_enabled() {
-                "已配置"
+                ui.tr("configured")
             } else {
-                "未配置"
+                ui.tr("not-configured")
             }
         )),
         Line::from(format!(
-            "自动切换 {}",
+            "{} {}",
+            ui.tr("auto-switch"),
             if ui.config.proxy.auto_switch {
-                "开启"
+                ui.tr("on")
             } else {
-                "关闭"
+                ui.tr("off")
             }
         )),
-        Line::from(format!("策略     {:?}", ui.config.proxy.strategy)),
-        Line::from(format!("阈值     {:.0}%", ui.config.proxy.threshold)),
-        Line::from(format!("数据库   {database}")),
+        Line::from(format!(
+            "{}     {:?}",
+            ui.tr("strategy"),
+            ui.config.proxy.strategy
+        )),
+        Line::from(format!(
+            "{}     {:.0}%",
+            ui.tr("threshold"),
+            ui.config.proxy.threshold
+        )),
+        Line::from(format!("{}   {database}", ui.tr("database"))),
         Line::from(format!(
             "RPS 5m   {:.2}",
             ui.metrics.as_ref().map_or(0.0, |metrics| metrics.rps)
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "快捷控制",
+            ui.tr("quick-controls"),
             Style::default()
                 .fg(theme.focus)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from("s 启动/停止   p 暂停/恢复"),
-        Line::from("c Codex 接入  a 自动切换"),
+        Line::from(ui.tr("quick-start-pause")),
+        Line::from(ui.tr("quick-codex-auto")),
     ];
     if let Some(snapshot) = &ui.snapshot {
         lines.push(Line::from(""));
+        let alert_heading = if snapshot.alerts.is_empty() {
+            format!("✓ {}", ui.tr("no-alerts"))
+        } else {
+            ui.tr("highest-alert")
+        };
         lines.push(Line::from(Span::styled(
-            if snapshot.alerts.is_empty() {
-                "✓ 当前无告警"
-            } else {
-                "最高优先级告警"
-            },
+            alert_heading,
             Style::default()
                 .fg(if snapshot.alerts.is_empty() {
                     theme.success
@@ -643,7 +703,11 @@ fn draw_control(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: su
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(theme.text).bg(theme.surface))
-            .block(panel_block(theme, "1  控制与告警", focused)),
+            .block(panel_block(
+                theme,
+                &format!("1  {}", ui.tr("control-alerts")),
+                focused,
+            )),
         area,
     );
 }
@@ -653,6 +717,20 @@ fn draw_pool(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: super
         .snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.current_account);
+    // Each pool row is intentionally laid out using terminal-cell widths, not
+    // byte or character counts. Localized status names (for example French
+    // "Disponible") otherwise shift the P/S quota columns on every row.
+    let content_width = usize::from(area.width.saturating_sub(4));
+    let quota_width = if content_width >= 62 {
+        8
+    } else if content_width >= 48 {
+        6
+    } else {
+        4
+    };
+    let status_width = content_width
+        .saturating_sub(quota_width * 2 + 8)
+        .clamp(8, 12);
     let items = ui
         .index
         .accounts
@@ -660,15 +738,29 @@ fn draw_pool(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: super
         .enumerate()
         .map(|(position, account)| {
             let selected = position == ui.pool_selected;
-            let (status_color, status) = status_style(theme, &account.status.kind);
+            let (status_color, status) = status_style(ui, theme, &account.status.kind);
             let runtime = ui.snapshot.as_ref().and_then(|snapshot| {
                 snapshot
                     .account_runtime
                     .iter()
                     .find(|runtime| runtime.account_id == account.id)
             });
-            let primary = mini_quota(account.status.primary.as_ref());
-            let secondary = mini_quota(account.status.secondary.as_ref());
+            let primary = mini_quota(account.status.primary.as_ref(), quota_width);
+            let secondary = mini_quota(account.status.secondary.as_ref(), quota_width);
+            let runtime_label = runtime.map_or_else(
+                || format!("0 {}", ui.tr("instances")),
+                |runtime| {
+                    runtime.circuit_reason.as_ref().map_or_else(
+                        || format!("{} {}", runtime.bound_instances, ui.tr("instances")),
+                        |reason| format!("{} {reason}", ui.tr("circuited")),
+                    )
+                },
+            );
+            let quota_line_width = 2 + status_width + 3 + quota_width + 3 + quota_width;
+            let show_runtime =
+                quota_line_width + 2 + display_width(&runtime_label) <= content_width;
+            let label_width =
+                content_width.saturating_sub(if current == Some(account.id) { 14 } else { 4 });
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(
@@ -688,7 +780,7 @@ fn draw_pool(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: super
                         }),
                     ),
                     Span::styled(
-                        account.label.chars().take(22).collect::<String>(),
+                        truncate_display(&account.label, label_width),
                         Style::default()
                             .fg(if selected {
                                 theme.selected_text
@@ -712,21 +804,31 @@ fn draw_pool(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: super
                 ]),
                 Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(status, Style::default().fg(status_color)),
                     Span::styled(
-                        format!(
-                            "  P {primary}  S {secondary}  {}",
-                            runtime.map_or_else(
-                                || "0 实例".into(),
-                                |runtime| runtime.circuit_reason.as_ref().map_or_else(
-                                    || format!("{} 实例", runtime.bound_instances),
-                                    |reason| format!("熔断 {reason}")
-                                )
-                            )
-                        ),
+                        pad_display(&status, status_width),
+                        Style::default().fg(status_color),
+                    ),
+                    Span::styled(
+                        format!("  P {primary}  S {secondary}"),
+                        Style::default().fg(theme.muted),
+                    ),
+                    Span::styled(
+                        if show_runtime {
+                            format!("  {runtime_label}")
+                        } else {
+                            String::new()
+                        },
                         Style::default().fg(theme.muted),
                     ),
                 ]),
+                Line::from(Span::styled(
+                    if show_runtime {
+                        String::new()
+                    } else {
+                        format!("  {runtime_label}")
+                    },
+                    Style::default().fg(theme.muted),
+                )),
             ])
             .style(Style::default().bg(if selected {
                 theme.selected_bg
@@ -738,7 +840,10 @@ fn draw_pool(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: super
     frame.render_widget(
         List::new(items).block(panel_block(
             theme,
-            "2  账户池  Space 加入/移出 · x 切换",
+            &truncate_display(
+                &format!("2  {}  Space +/- · x", ui.tr("account-pool")),
+                usize::from(area.width.saturating_sub(4)),
+            ),
             focused,
         )),
         area,
@@ -765,13 +870,13 @@ fn draw_instances(
             let pid = instance
                 .pid
                 .map(|pid| pid.to_string())
-                .unwrap_or_else(|| "未知".into());
+                .unwrap_or_else(|| ui.tr("unknown"));
             let cwd = instance
                 .working_directory
                 .as_ref()
                 .and_then(|path| path.file_name())
                 .map(|name| name.to_string_lossy())
-                .unwrap_or_else(|| "未知目录".into());
+                .unwrap_or_else(|| ui.tr("unknown-directory").into());
             ListItem::new(vec![
                 Line::from(vec![
                     Span::styled(
@@ -783,7 +888,7 @@ fn draw_instances(
                         Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("  {} 请求", instance.active_requests),
+                        format!("  {} {}", instance.active_requests, ui.tr("requests")),
                         Style::default().fg(theme.warning),
                     ),
                 ]),
@@ -794,7 +899,7 @@ fn draw_instances(
                         instance
                             .current_account
                             .map(|id| id.to_string().chars().take(8).collect::<String>())
-                            .unwrap_or_else(|| "未绑定".into())
+                            .unwrap_or_else(|| ui.tr("unbound"))
                     ),
                     Style::default().fg(theme.muted),
                 )),
@@ -808,9 +913,9 @@ fn draw_instances(
         .collect::<Vec<_>>();
     let items = if items.is_empty() {
         vec![ListItem::new(vec![
-            Line::from("  暂无活动实例"),
+            Line::from(format!("  {}", ui.tr("no-active-instances"))),
             Line::from(Span::styled(
-                "  新请求会实时出现在这里",
+                format!("  {}", ui.tr("new-requests-here")),
                 Style::default().fg(theme.muted),
             )),
         ])]
@@ -818,7 +923,11 @@ fn draw_instances(
         items
     };
     frame.render_widget(
-        List::new(items).block(panel_block(theme, "3  活动实例", focused)),
+        List::new(items).block(panel_block(
+            theme,
+            &format!("3  {}", ui.tr("active-instances")),
+            focused,
+        )),
         area,
     );
 }
@@ -855,7 +964,7 @@ fn draw_events(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: sup
                     format!(
                         "  {} ms · {} · retry {}",
                         request.duration_ms.unwrap_or(0),
-                        request.route_reason,
+                        localized_route_reason(ui, request),
                         request.retries
                     ),
                     Style::default().fg(theme.muted),
@@ -887,7 +996,7 @@ fn draw_events(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: sup
                 ),
             ]),
             Line::from(Span::styled(
-                format!("  {}", event.detail),
+                format!("  {}", localized_event_detail(ui, event)),
                 Style::default().fg(theme.muted),
             )),
         ])
@@ -900,9 +1009,9 @@ fn draw_events(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: sup
     let empty = items.is_empty();
     let items = if empty {
         vec![ListItem::new(vec![
-            Line::from("  暂无近期事件"),
+            Line::from(format!("  {}", ui.tr("no-recent-events"))),
             Line::from(Span::styled(
-                "  只记录脱敏元数据",
+                format!("  {}", ui.tr("sanitized-metadata-only")),
                 Style::default().fg(theme.muted),
             )),
         ])]
@@ -911,9 +1020,14 @@ fn draw_events(frame: &mut Frame, area: Rect, ui: &Ui, focused: bool, theme: sup
     };
     let total = ui.recent_requests.len() + ui.recent_events.len();
     let title = if total == 0 {
-        "4  近期事件".to_string()
+        format!("4  {}", ui.tr("recent-events"))
     } else {
-        format!("4  近期事件 · {}/{}", ui.event_selected + 1, total)
+        format!(
+            "4  {} · {}/{}",
+            ui.tr("recent-events"),
+            ui.event_selected + 1,
+            total
+        )
     };
     let mut state = ListState::default().with_selected((!empty).then_some(ui.event_selected));
     frame.render_stateful_widget(
@@ -948,56 +1062,79 @@ fn draw_detail(
                             .find(|runtime| runtime.account_id == account.id)
                     });
                     vec![
-                        Line::from(format!("名称        {}", account.label)),
+                        Line::from(format!("{}        {}", ui.tr("name"), account.label)),
                         Line::from(format!(
-                            "邮箱        {}",
-                            account.email.as_deref().unwrap_or("未知")
+                            "{}        {}",
+                            ui.tr("email"),
+                            account.email.clone().unwrap_or_else(|| ui.tr("unknown"))
                         )),
                         Line::from(format!(
-                            "套餐        {}",
-                            account.plan.as_deref().unwrap_or("未知")
+                            "{}        {}",
+                            ui.tr("plan"),
+                            account.plan.clone().unwrap_or_else(|| ui.tr("unknown"))
                         )),
                         Line::from(format!(
-                            "代理池      {}",
+                            "{}      {}",
+                            ui.tr("account-pool"),
                             if account.proxy_enabled {
-                                "已加入"
+                                ui.tr("joined")
                             } else {
-                                "未加入"
+                                ui.tr("not-joined")
                             }
                         )),
-                        Line::from(format!("状态        {}", account.status.detail)),
                         Line::from(format!(
-                            "绑定实例    {}",
+                            "{}        {}",
+                            ui.tr("status"),
+                            account.status.detail
+                        )),
+                        Line::from(format!(
+                            "{}    {}",
+                            ui.tr("bound-instances"),
                             runtime.map_or(0, |runtime| runtime.bound_instances)
                         )),
                         Line::from(format!(
-                            "熔断状态    {}",
+                            "{}    {}",
+                            ui.tr("circuit-state"),
                             runtime
                                 .and_then(|runtime| runtime.circuit_reason.as_deref())
-                                .unwrap_or("未熔断")
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| ui.tr("not-circuited"))
                         )),
                         Line::from(""),
-                        Line::from("凭据、Authorization、提示词和响应正文不会显示在此处。"),
+                        Line::from(ui.tr("privacy-detail-note")),
                     ]
                 })
-                .unwrap_or_else(|| vec![Line::from("账户已不存在")]);
-            ("账户详情", lines)
+                .unwrap_or_else(|| vec![Line::from(ui.tr("account-gone"))]);
+            (ui.tr("account-details"), lines)
         }
         DetailPage::Control => (
-            "代理控制详情",
+            ui.tr("proxy-control-details"),
             [
-                format!("运行状态      {:?}", ui.runtime_state()),
                 format!(
-                    "Codex 接入    {}",
+                    "{}      {}",
+                    ui.tr("runtime-status"),
+                    runtime_label(ui, &ui.runtime_state(), theme).0
+                ),
+                format!(
+                    "{}    {}",
+                    ui.tr("codex-integration"),
                     if ui.integration_enabled() {
-                        "开启"
+                        ui.tr("on")
                     } else {
-                        "关闭"
+                        ui.tr("off")
                     }
                 ),
-                format!("自动切换      {}", ui.config.proxy.auto_switch),
-                format!("路由策略      {:?}", ui.config.proxy.strategy),
-                format!("使用阈值      {:.0}%", ui.config.proxy.threshold),
+                format!(
+                    "{}      {}",
+                    ui.tr("auto-switch"),
+                    ui.config.proxy.auto_switch
+                ),
+                format!("{}      {:?}", ui.tr("strategy"), ui.config.proxy.strategy),
+                format!(
+                    "{}      {:.0}%",
+                    ui.tr("threshold"),
+                    ui.config.proxy.threshold
+                ),
             ]
             .into_iter()
             .enumerate()
@@ -1030,11 +1167,20 @@ fn draw_detail(
             .chain([
                 Line::from(""),
                 Line::from(Span::styled(
-                    "j/k 选择 · Enter/Space 修改 · Esc 返回",
+                    ui.tr("control-detail-controls"),
                     Style::default().fg(theme.muted),
                 )),
-                Line::from(format!("监听地址      {}", ui.config.proxy.listen_addr)),
-                Line::from(format!("历史保留      {} 天", ui.config.retention.days)),
+                Line::from(format!(
+                    "{}      {}",
+                    ui.tr("listen-address"),
+                    ui.config.proxy.listen_addr
+                )),
+                Line::from(format!(
+                    "{}      {} {}",
+                    ui.tr("history-retention"),
+                    ui.config.retention.days,
+                    ui.tr("days")
+                )),
             ])
             .collect(),
         ),
@@ -1050,46 +1196,62 @@ fn draw_detail(
                             instance
                                 .pid
                                 .map(|pid| pid.to_string())
-                                .unwrap_or_else(|| "未知".into())
+                                .unwrap_or_else(|| ui.tr("unknown"))
                         )),
                         Line::from(format!(
-                            "父 PID      {}",
+                            "{}      {}",
+                            ui.tr("parent-pid"),
                             instance
                                 .parent_pid
                                 .map(|pid| pid.to_string())
-                                .unwrap_or_else(|| "未知".into())
+                                .unwrap_or_else(|| ui.tr("unknown"))
                         )),
                         Line::from(format!(
-                            "可执行文件  {}",
+                            "{}  {}",
+                            ui.tr("executable"),
                             instance
                                 .executable
                                 .as_ref()
                                 .map(|path| path.display().to_string())
-                                .unwrap_or_else(|| "未知".into())
+                                .unwrap_or_else(|| ui.tr("unknown"))
                         )),
                         Line::from(format!(
-                            "工作目录    {}",
+                            "{}    {}",
+                            ui.tr("working-directory"),
                             instance
                                 .working_directory
                                 .as_ref()
                                 .map(|path| path.display().to_string())
-                                .unwrap_or_else(|| "未知".into())
+                                .unwrap_or_else(|| ui.tr("unknown"))
                         )),
-                        Line::from(format!("实例标识    {}", instance.client_instance_id)),
-                        Line::from(format!("设备        {}", instance.device_id)),
-                        Line::from(format!("活动请求    {}", instance.active_requests)),
-                        Line::from(format!("最长请求    {} ms", instance.oldest_request_ms)),
                         Line::from(format!(
-                            "粘性账户    {}",
+                            "{}    {}",
+                            ui.tr("instance-id"),
+                            instance.client_instance_id
+                        )),
+                        Line::from(format!("{}        {}", ui.tr("device"), instance.device_id)),
+                        Line::from(format!(
+                            "{}    {}",
+                            ui.tr("active-requests"),
+                            instance.active_requests
+                        )),
+                        Line::from(format!(
+                            "{}    {} ms",
+                            ui.tr("oldest-request"),
+                            instance.oldest_request_ms
+                        )),
+                        Line::from(format!(
+                            "{}    {}",
+                            ui.tr("sticky-account"),
                             instance
                                 .current_account
                                 .map(|id| id.to_string())
-                                .unwrap_or_else(|| "尚未绑定".into())
+                                .unwrap_or_else(|| ui.tr("not-bound"))
                         )),
                     ]
                 })
-                .unwrap_or_else(|| vec![Line::from("实例已结束")]);
-            ("Codex 实例详情", lines)
+                .unwrap_or_else(|| vec![Line::from(ui.tr("instance-ended"))]);
+            (ui.tr("instance-details"), lines)
         }
         DetailPage::Request(index) => {
             let lines = ui
@@ -1098,37 +1260,55 @@ fn draw_detail(
                 .map(|request| {
                     vec![
                         Line::from(format!(
-                            "时间        {}",
+                            "{}        {}",
+                            ui.tr("time"),
                             request
                                 .started_at
                                 .with_timezone(&Local)
                                 .format("%Y-%m-%d %H:%M:%S")
                         )),
-                        Line::from(format!("请求        {} {}", request.method, request.path)),
                         Line::from(format!(
-                            "状态        {}",
+                            "{}        {} {}",
+                            ui.tr("request"),
+                            request.method,
+                            request.path
+                        )),
+                        Line::from(format!(
+                            "{}        {}",
+                            ui.tr("status"),
                             request
                                 .status
                                 .map(|status| status.to_string())
-                                .unwrap_or_else(|| "未知".into())
+                                .unwrap_or_else(|| ui.tr("unknown"))
                         )),
-                        Line::from(format!("阶段        {}", request.stage)),
+                        Line::from(format!("{}        {}", ui.tr("stage"), request.stage)),
                         Line::from(format!("TTFB        {} ms", request.ttfb_ms.unwrap_or(0))),
                         Line::from(format!(
-                            "总耗时      {} ms",
+                            "{}      {} ms",
+                            ui.tr("total-duration"),
                             request.duration_ms.unwrap_or(0)
                         )),
                         Line::from(format!(
-                            "上/下行     {} / {} bytes",
-                            request.request_bytes, request.response_bytes
+                            "{}     {} / {} bytes",
+                            ui.tr("traffic"),
+                            request.request_bytes,
+                            request.response_bytes
                         )),
-                        Line::from(format!("路由原因    {}", request.route_reason)),
-                        Line::from(format!("重试        {}", request.retries)),
-                        Line::from(format!("中途断流    {}", request.partial_failure)),
+                        Line::from(format!(
+                            "{}    {}",
+                            ui.tr("route-reason"),
+                            localized_route_reason(ui, request)
+                        )),
+                        Line::from(format!("{}        {}", ui.tr("retries"), request.retries)),
+                        Line::from(format!(
+                            "{}    {}",
+                            ui.tr("partial-failure"),
+                            request.partial_failure
+                        )),
                     ]
                 })
-                .unwrap_or_else(|| vec![Line::from("请求摘要已过期")]);
-            ("请求摘要详情", lines)
+                .unwrap_or_else(|| vec![Line::from(ui.tr("request-expired"))]);
+            (ui.tr("request-details"), lines)
         }
         DetailPage::Event(index) => {
             let lines = ui
@@ -1137,35 +1317,41 @@ fn draw_detail(
                 .map(|event| {
                     vec![
                         Line::from(format!(
-                            "时间      {}",
+                            "{}      {}",
+                            ui.tr("time"),
                             event
                                 .occurred_at
                                 .with_timezone(&Local)
                                 .format("%Y-%m-%d %H:%M:%S")
                         )),
-                        Line::from(format!("类型      {}", event.kind)),
-                        Line::from(format!("租户      {}", event.tenant_id)),
-                        Line::from(format!("设备      {}", event.device_id)),
+                        Line::from(format!("{}      {}", ui.tr("type"), event.kind)),
+                        Line::from(format!("{}      {}", ui.tr("tenant"), event.tenant_id)),
+                        Line::from(format!("{}      {}", ui.tr("device"), event.device_id)),
                         Line::from(format!(
-                            "账户      {}",
+                            "{}      {}",
+                            ui.tr("accounts"),
                             event
                                 .account_id
                                 .map(|id| id.to_string())
-                                .unwrap_or_else(|| "无".into())
+                                .unwrap_or_else(|| ui.tr("none"))
                         )),
                         Line::from(""),
-                        Line::from(event.detail.as_str()),
+                        Line::from(localized_event_detail(ui, event)),
                     ]
                 })
-                .unwrap_or_else(|| vec![Line::from("事件已过期")]);
-            ("事件详情", lines)
+                .unwrap_or_else(|| vec![Line::from(ui.tr("event-expired"))]);
+            (ui.tr("event-details"), lines)
         }
     };
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(theme.text).bg(theme.surface))
-            .block(panel_block(theme, &format!("{title}  ·  Esc 返回"), true)),
+            .block(panel_block(
+                theme,
+                &format!("{title}  ·  Esc {}", ui.tr("back")),
+                true,
+            )),
         area,
     );
 }
@@ -1178,27 +1364,103 @@ fn draw_modal(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
         Modal::ModeSelector => draw_choice_card(
             frame,
             theme,
-            "切换工作区",
+            &ui.tr("mode-title"),
             &[
-                ("1", "ACCOUNT", "认证快照、额度检测与账户切换"),
-                ("2", "PROXY", "代理健康、账户池、实例与事件"),
+                ("1".into(), "ACCOUNT".into(), ui.tr("mode-account-detail")),
+                ("2".into(), "PROXY".into(), ui.tr("mode-proxy-detail")),
             ],
-            "按 1/2 立即进入  ·  Esc 返回",
+            &ui.tr("mode-controls"),
         ),
         Modal::Onboarding => draw_choice_card(
             frame,
             theme,
-            "把代理跑起来",
+            &ui.tr("onboarding-title"),
             &[
-                ("1", "准备账户", "检测后按 Space 明确加入代理池"),
-                ("2", "启动代理", "只监听本地回环地址"),
-                ("3", "接入 Codex", "备份并安全更新 config.toml"),
+                (
+                    "1".into(),
+                    ui.tr("onboarding-account"),
+                    ui.tr("onboarding-account-detail"),
+                ),
+                (
+                    "2".into(),
+                    ui.tr("onboarding-proxy"),
+                    ui.tr("onboarding-proxy-detail"),
+                ),
+                (
+                    "3".into(),
+                    ui.tr("onboarding-codex"),
+                    ui.tr("onboarding-codex-detail"),
+                ),
             ],
-            "建议顺序 1 → 2 → 3  ·  ? 打开完整指南  ·  Esc 稍后再说",
+            &ui.tr("onboarding-controls"),
         ),
+        Modal::LanguageSelector => draw_language_selector(frame, ui, theme),
         Modal::None => {}
         _ => {}
     }
+}
+
+fn draw_language_selector(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
+    let popup = centered_fixed(64, 14, frame.area());
+    frame.render_widget(Clear, popup);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(8),
+        Constraint::Length(2),
+    ])
+    .split(popup.inner(ratatui::layout::Margin {
+        horizontal: 2,
+        vertical: 1,
+    }));
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" 🌐 {} ", ui.tr("language-title")))
+            .border_style(Style::default().fg(theme.focus))
+            .style(Style::default().bg(theme.surface)),
+        popup,
+    );
+    let items = LanguagePreference::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, preference)| {
+            let name = if *preference == LanguagePreference::Auto {
+                translate_with(
+                    ui.language(),
+                    "language-auto-current",
+                    [("language", preference.resolve().native_name())],
+                )
+            } else {
+                preference.resolve().native_name().to_owned()
+            };
+            let selected = index == ui.language_selected;
+            ListItem::new(format!(" {}  {name}", index + 1)).style(
+                Style::default()
+                    .fg(if selected {
+                        theme.selected_text
+                    } else {
+                        theme.text
+                    })
+                    .bg(if selected {
+                        theme.selected_bg
+                    } else {
+                        theme.surface
+                    })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items), rows[1]);
+    frame.render_widget(
+        Paragraph::new(ui.tr("language-help"))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted)),
+        rows[2],
+    );
 }
 
 fn draw_help_center(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
@@ -1209,10 +1471,13 @@ fn draw_help_center(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
             .title(Line::from(vec![
                 Span::styled(" ◈ ", Style::default().fg(theme.focus)),
                 Span::styled(
-                    "使用指南 ",
+                    format!("{} ", ui.tr("help-guide-title")),
                     Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("从第一个账户到稳定路由", Style::default().fg(theme.muted)),
+                Span::styled(
+                    ui.tr("help-guide-subtitle"),
+                    Style::default().fg(theme.muted),
+                ),
             ]))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.focus))
@@ -1255,7 +1520,7 @@ fn draw_help_center(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!(" {}", page.title()),
+                        format!(" {}", page.title(ui.language())),
                         Style::default()
                             .fg(if active { theme.text } else { theme.muted })
                             .add_modifier(if active {
@@ -1270,7 +1535,7 @@ fn draw_help_center(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
         frame.render_widget(
             List::new(items).block(
                 Block::default()
-                    .title("章 节")
+                    .title(ui.tr("help-sections"))
                     .borders(Borders::RIGHT)
                     .border_style(Style::default().fg(theme.border)),
             ),
@@ -1283,7 +1548,7 @@ fn draw_help_center(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
             .map(|(index, page)| {
                 let active = *page == ui.help_page;
                 Span::styled(
-                    format!(" {} {} ", index + 1, page.title()),
+                    format!(" {} {} ", index + 1, page.title(ui.language())),
                     Style::default()
                         .fg(if active {
                             theme.background
@@ -1302,14 +1567,14 @@ fn draw_help_center(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
         frame.render_widget(Paragraph::new(Line::from(tabs)), chunks[0]);
     }
     let body_area = if wide { chunks[2] } else { chunks[1] };
-    let body = Paragraph::new(help_lines(ui.help_page, theme))
+    let body = Paragraph::new(help_lines(ui.help_page, theme, ui))
         .scroll((ui.help_scroll, 0))
         .wrap(Wrap { trim: false })
         .block(
             Block::default()
                 .title(format!(
                     "{}  ·  {}/4",
-                    ui.help_page.title(),
+                    ui.help_page.title(ui.language()),
                     ui.help_page as usize + 1
                 ))
                 .borders(Borders::BOTTOM)
@@ -1324,14 +1589,27 @@ fn draw_help_center(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
         1,
     );
     frame.render_widget(
-        Paragraph::new("Tab/Shift-Tab 翻页   1–4 直达   j/k 滚动   Home/End   Esc 关闭")
+        Paragraph::new(ui.tr("help-controls"))
             .alignment(Alignment::Center)
             .style(Style::default().fg(theme.muted)),
         footer,
     );
 }
 
-fn help_lines(page: HelpPage, theme: super::ThemeColors) -> Vec<Line<'static>> {
+fn help_lines(page: HelpPage, theme: super::ThemeColors, ui: &Ui) -> Vec<Line<'static>> {
+    if ui.language() != Language::ZhCn {
+        let key = match page {
+            HelpPage::QuickStart => "help-body-quick",
+            HelpPage::Account => "help-body-account",
+            HelpPage::Proxy => "help-body-proxy",
+            HelpPage::Safety => "help-body-safety",
+        };
+        return ui
+            .tr(key)
+            .split("\\n")
+            .map(|line| Line::from(line.to_owned()))
+            .collect();
+    }
     let heading = |text: &'static str| {
         Line::from(Span::styled(
             text,
@@ -1382,6 +1660,10 @@ fn help_lines(page: HelpPage, theme: super::ThemeColors) -> Vec<Line<'static>> {
             key("a / i", "导入当前认证 / 导入 JSON 或文件路径"),
             key("r / R", "检测选中账户 / 检测全部"),
             key("n / d", "重命名 / 删除快照"),
+            key(
+                "l / 🌐",
+                "Language · 语言 · 言語 · Idioma · Sprache · Lingua · Langue",
+            ),
             key("/", "按名称或邮箱过滤；Esc 清除过滤"),
             Line::from(""),
             heading("输入框"),
@@ -1422,12 +1704,12 @@ fn help_lines(page: HelpPage, theme: super::ThemeColors) -> Vec<Line<'static>> {
 
 fn draw_text_editor(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
     let (title, hint, width) = match ui.modal {
-        Modal::Import => ("导入认证", "粘贴 JSON，或输入 auth.json 路径", 74),
-        Modal::Filter => ("过滤账户", "按名称或邮箱即时过滤", 58),
-        Modal::Rename => ("重命名账户", "使用一个容易辨认的名称", 58),
+        Modal::Import => (ui.tr("editor-import"), ui.tr("editor-import-hint"), 74),
+        Modal::Filter => (ui.tr("editor-filter"), ui.tr("editor-filter-hint"), 58),
+        Modal::Rename => (ui.tr("editor-rename"), ui.tr("editor-rename-hint"), 58),
         Modal::Settings => (
-            "Codex 目录",
-            "输入包含 config.toml 与 auth.json 的绝对路径",
+            ui.tr("editor-codex-home"),
+            ui.tr("editor-codex-home-hint"),
             74,
         ),
         _ => return,
@@ -1462,7 +1744,7 @@ fn draw_text_editor(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
             .style(Style::default().fg(theme.text))
             .block(
                 Block::default()
-                    .title(" 输入 ")
+                    .title(format!(" {} ", ui.tr("input")))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.focus)),
             ),
@@ -1536,7 +1818,7 @@ fn draw_text_editor(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
         1,
     );
     frame.render_widget(
-        Paragraph::new("Enter 确认   Tab 补全   ↑/↓ 选择   Ctrl-A/E/W/U/K 编辑   Esc 取消")
+        Paragraph::new(ui.tr("editor-controls"))
             .alignment(Alignment::Center)
             .style(Style::default().fg(theme.muted)),
         footer,
@@ -1575,60 +1857,60 @@ fn visible_input(value: &str, cursor: usize, max_width: usize) -> (&str, u16) {
 fn draw_confirmation(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
     let (title, detail, dangerous, cancel_label, confirm_label) = match ui.modal {
         Modal::ConfirmUseEmail => (
-            "使用检测到的邮箱？",
-            "邮箱通常是最易辨认的账户名。",
+            ui.tr("confirm-email-title"),
+            ui.tr("confirm-email-detail"),
             false,
-            "自定义",
-            "使用邮箱",
+            ui.tr("custom"),
+            ui.tr("use-email"),
         ),
         Modal::ConfirmDelete => (
-            "删除账户快照？",
-            "这会删除本地快照与索引记录，不会注销 OpenAI 账户。",
+            ui.tr("confirm-delete-title"),
+            ui.tr("confirm-delete-detail"),
             true,
-            "取消",
-            "删除",
+            ui.tr("cancel"),
+            ui.tr("delete"),
         ),
         Modal::ConfirmIntegrationEnable => (
-            "启用 Codex 接入？",
-            "将先备份，再安全更新 $CODEX_HOME/config.toml。修改后需重启 Codex。",
+            ui.tr("confirm-integration-on-title"),
+            ui.tr("confirm-integration-on-detail"),
             false,
-            "取消",
-            "启用",
+            ui.tr("cancel"),
+            ui.tr("enable"),
         ),
         Modal::ConfirmIntegrationDisable => (
-            "停用 Codex 接入？",
-            "只恢复本工具管理的键；发现外部配置漂移时会拒绝覆盖。",
+            ui.tr("confirm-integration-off-title"),
+            ui.tr("confirm-integration-off-detail"),
             false,
-            "取消",
-            "停用",
+            ui.tr("cancel"),
+            ui.tr("disable"),
         ),
         Modal::ConfirmProxyStart => (
-            "启动本地代理？",
-            "将在 127.0.0.1 上启动流式路由，只使用已入池且健康的账户。",
+            ui.tr("confirm-proxy-start-title"),
+            ui.tr("confirm-proxy-start-detail"),
             false,
-            "取消",
-            "启动",
+            ui.tr("cancel"),
+            ui.tr("start"),
         ),
         Modal::ConfirmProxyStop => (
-            "停止代理并恢复 Codex？",
-            "停止接收新请求，活动请求最多排空 30 秒，然后恢复 Codex 配置。",
+            ui.tr("confirm-proxy-stop-title"),
+            ui.tr("confirm-proxy-stop-detail"),
             true,
-            "继续运行",
-            "停止",
+            ui.tr("keep-running"),
+            ui.tr("stop"),
         ),
         Modal::ConfirmAutoSwitch => (
-            "启用自动切换？",
-            "只在安全请求边界切换账户；已开始输出的 SSE 永不迁移。",
+            ui.tr("confirm-auto-title"),
+            ui.tr("confirm-auto-detail"),
             false,
-            "取消",
-            "启用",
+            ui.tr("cancel"),
+            ui.tr("enable"),
         ),
         Modal::ConfirmExit => (
-            "退出并停止内嵌代理？",
-            "仍有活动请求。将停止接收新请求，并最多排空 30 秒。",
+            ui.tr("confirm-exit-title"),
+            ui.tr("confirm-exit-detail"),
             true,
-            "留在这里",
-            "退出",
+            ui.tr("stay"),
+            ui.tr("exit"),
         ),
         _ => return,
     };
@@ -1690,7 +1972,7 @@ fn draw_confirmation(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
         .split(button_area);
     frame.render_widget(
         Paragraph::new(button(
-            cancel_label,
+            &cancel_label,
             ui.confirm_choice == ConfirmChoice::Cancel,
             theme.focus,
         ))
@@ -1699,7 +1981,7 @@ fn draw_confirmation(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
     );
     frame.render_widget(
         Paragraph::new(button(
-            confirm_label,
+            &confirm_label,
             ui.confirm_choice == ConfirmChoice::Confirm,
             accent,
         ))
@@ -1707,7 +1989,7 @@ fn draw_confirmation(frame: &mut Frame, ui: &Ui, theme: super::ThemeColors) {
         button_areas[1],
     );
     frame.render_widget(
-        Paragraph::new("←/→ 或 Tab 选择   Enter 执行   y/n 快捷键   Esc 取消")
+        Paragraph::new(ui.tr("confirm-controls"))
             .alignment(Alignment::Center)
             .style(Style::default().fg(theme.muted)),
         Rect::new(
@@ -1723,7 +2005,7 @@ fn draw_choice_card(
     frame: &mut Frame,
     theme: super::ThemeColors,
     title: &str,
-    choices: &[(&str, &str, &str)],
+    choices: &[(String, String, String)],
     footer: &str,
 ) {
     let height = 7 + choices.len() as u16 * 2;
@@ -1751,7 +2033,7 @@ fn draw_choice_card(
                 format!("  {name:<12}"),
                 Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(*detail, Style::default().fg(theme.muted)),
+            Span::styled(detail.clone(), Style::default().fg(theme.muted)),
         ]));
         lines.push(Line::from(""));
     }
@@ -1892,11 +2174,12 @@ fn draw_quota(
     area: Rect,
     title: &str,
     quota: Option<&Quota>,
+    ui: &Ui,
     theme: super::ThemeColors,
 ) {
     let Some(quota) = quota else {
         frame.render_widget(
-            Paragraph::new("尚无数据 · 按 r 检测")
+            Paragraph::new(ui.tr("quota-no-data"))
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(theme.warning).bg(theme.surface))
                 .block(panel_block(theme, title, false)),
@@ -1915,8 +2198,12 @@ fn draw_quota(
     frame.render_widget(block, area);
     let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
     frame.render_widget(
-        Paragraph::new(format!("{remaining:.0}% 剩余 · 重置 {reset}"))
-            .style(Style::default().fg(theme.progress_text).bg(theme.surface)),
+        Paragraph::new(translate_with(
+            ui.language(),
+            "quota-remaining",
+            [("remaining", format!("{remaining:.0}")), ("reset", reset)],
+        ))
+        .style(Style::default().fg(theme.progress_text).bg(theme.surface)),
         rows[0],
     );
     frame.render_widget(
@@ -1929,12 +2216,49 @@ fn draw_quota(
     );
 }
 
-fn mini_quota(quota: Option<&Quota>) -> String {
+fn mini_quota(quota: Option<&Quota>, width: usize) -> String {
     let Some(quota) = quota else {
-        return "········".into();
+        return "·".repeat(width);
     };
-    let filled = (((100.0 - quota.used_percent).clamp(0.0, 100.0) / 100.0) * 8.0).round() as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled))
+    let filled =
+        (((100.0 - quota.used_percent).clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+/// Restrict text by the number of terminal cells it occupies, preserving UTF-8
+/// boundaries and leaving room for an ellipsis when truncation is needed.
+fn truncate_display(value: &str, width: usize) -> String {
+    if display_width(value) <= width {
+        return value.into();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > width - 1 {
+            break;
+        }
+        result.push(character);
+        used += character_width;
+    }
+    result.push('…');
+    result
+}
+
+fn pad_display(value: &str, width: usize) -> String {
+    let mut result = truncate_display(value, width);
+    result.push_str(&" ".repeat(width.saturating_sub(display_width(&result))));
+    result
 }
 
 fn panel_block<'a>(theme: super::ThemeColors, title: &'a str, focused: bool) -> Block<'a> {
@@ -1953,26 +2277,26 @@ fn panel_block<'a>(theme: super::ThemeColors, title: &'a str, focused: bool) -> 
         .style(Style::default().fg(theme.text).bg(theme.surface))
 }
 
-fn runtime_label(runtime: &RuntimeState, theme: super::ThemeColors) -> (&'static str, Color) {
+fn runtime_label(ui: &Ui, runtime: &RuntimeState, theme: super::ThemeColors) -> (String, Color) {
     match runtime {
-        RuntimeState::Stopped => ("STOPPED", theme.muted),
-        RuntimeState::Starting => ("STARTING", theme.warning),
-        RuntimeState::Running => ("RUNNING", theme.success),
-        RuntimeState::Paused => ("PAUSED", theme.warning),
-        RuntimeState::Draining => ("DRAINING", theme.warning),
-        RuntimeState::Blocked => ("BLOCKED", theme.error),
-        RuntimeState::Error => ("ERROR", theme.error),
+        RuntimeState::Stopped => (ui.tr("runtime-stopped"), theme.muted),
+        RuntimeState::Starting => (ui.tr("runtime-starting"), theme.warning),
+        RuntimeState::Running => (ui.tr("runtime-running"), theme.success),
+        RuntimeState::Paused => (ui.tr("runtime-paused"), theme.warning),
+        RuntimeState::Draining => (ui.tr("runtime-draining"), theme.warning),
+        RuntimeState::Blocked => (ui.tr("runtime-blocked"), theme.error),
+        RuntimeState::Error => (ui.tr("runtime-error"), theme.error),
     }
 }
 
-fn status_style(theme: super::ThemeColors, kind: &StatusKind) -> (Color, &'static str) {
+fn status_style(ui: &Ui, theme: super::ThemeColors, kind: &StatusKind) -> (Color, String) {
     match kind {
-        StatusKind::Live => (theme.success, "✓ 可用"),
-        StatusKind::Exhausted => (theme.error, "✗ 耗尽"),
-        StatusKind::Reauth => (theme.warning, "⚠ 需登录"),
-        StatusKind::AccessDenied => (theme.error, "✗ 拒绝"),
-        StatusKind::Invalid => (theme.error, "✗ 无效"),
-        StatusKind::Unknown => (theme.unknown, "? 未知"),
+        StatusKind::Live => (theme.success, ui.tr("status-live")),
+        StatusKind::Exhausted => (theme.error, ui.tr("status-exhausted")),
+        StatusKind::Reauth => (theme.warning, ui.tr("status-reauth")),
+        StatusKind::AccessDenied => (theme.error, ui.tr("status-denied")),
+        StatusKind::Invalid => (theme.error, ui.tr("status-invalid")),
+        StatusKind::Unknown => (theme.unknown, ui.tr("status-unknown")),
     }
 }
 
@@ -1990,6 +2314,20 @@ fn active_account_id(ui: &Ui) -> Option<uuid::Uuid> {
         .map(|account| account.id)
 }
 
+fn localized_event_detail(ui: &Ui, event: &crate::storage::RuntimeEvent) -> String {
+    event.message.as_ref().map_or_else(
+        || event.detail.clone(),
+        |message| message.render(ui.language(), &event.detail),
+    )
+}
+
+fn localized_route_reason(ui: &Ui, request: &crate::storage::RequestSummary) -> String {
+    request.route_message.as_ref().map_or_else(
+        || request.route_reason.clone(),
+        |message| message.render(ui.language(), &request.route_reason),
+    )
+}
+
 fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width.saturating_sub(2)).max(1);
     let height = height.min(area.height.saturating_sub(2)).max(1);
@@ -2004,11 +2342,20 @@ fn centered_fixed(width: u16, height: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Config, types::AccountIndex};
+    use crate::{
+        config::Config,
+        types::{Account, AccountIndex, CheckStatus},
+    };
     use ratatui::{Terminal, backend::TestBackend};
 
+    fn test_config() -> Config {
+        let mut config = Config::defaults();
+        config.language = LanguagePreference::ZhCn;
+        config
+    }
+
     fn rendered(width: u16, height: u16, workspace: Workspace, panel: ProxyPanel) -> String {
-        let mut ui = Ui::new(Config::defaults(), AccountIndex::default(), None, workspace);
+        let mut ui = Ui::new(test_config(), AccountIndex::default(), None, workspace);
         ui.proxy_panel = panel;
         ui.modal = Modal::None;
         rendered_ui(width, height, &ui)
@@ -2053,6 +2400,65 @@ mod tests {
     }
 
     #[test]
+    fn localized_pool_statuses_keep_quota_columns_aligned() {
+        let mut config = Config::defaults();
+        config.language = LanguagePreference::Fr;
+        let quota = || {
+            Some(Quota {
+                used_percent: 25.0,
+                window_minutes: None,
+                resets_at: None,
+            })
+        };
+        let account = |label: &str, kind: StatusKind| Account {
+            id: uuid::Uuid::new_v4(),
+            label: label.into(),
+            source: "test".into(),
+            imported_at: chrono::Utc::now(),
+            email: None,
+            plan: None,
+            account_id: None,
+            status: CheckStatus {
+                kind,
+                checked_at: None,
+                detail: String::new(),
+                primary: quota(),
+                secondary: quota(),
+            },
+            tenant_id: "local".into(),
+            proxy_enabled: true,
+        };
+        let mut ui = Ui::new(
+            config,
+            AccountIndex {
+                accounts: vec![
+                    account("very-long-account-name@example.com", StatusKind::Live),
+                    account(
+                        "another-long-account-name@example.com",
+                        StatusKind::Exhausted,
+                    ),
+                ],
+            },
+            None,
+            Workspace::Proxy,
+        );
+        ui.modal = Modal::None;
+        ui.proxy_panel = ProxyPanel::Pool;
+        let screen = rendered_ui(72, 18, &ui);
+        let rows = screen
+            .lines()
+            .filter(|line| line.contains("Disponible") || line.contains("Épuisé"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "{screen}");
+        let column = |row: &str, marker| {
+            let index = row.find(marker).expect("marker in rendered row");
+            display_width(&row[..index])
+        };
+        assert_eq!(column(rows[0], "P "), column(rows[1], "P "), "{screen}");
+        assert_eq!(column(rows[0], "S "), column(rows[1], "S "), "{screen}");
+    }
+
+    #[test]
     fn minimum_proxy_terminal_does_not_panic_or_hide_mode() {
         let screen = rendered(40, 10, Workspace::Proxy, ProxyPanel::Control);
         assert!(screen.contains("PROXY"), "{screen}");
@@ -2063,7 +2469,7 @@ mod tests {
     #[test]
     fn onboarding_confirmation_and_detail_have_distinct_surfaces() {
         let mut ui = Ui::new(
-            Config::defaults(),
+            test_config(),
             AccountIndex::default(),
             None,
             Workspace::Proxy,
@@ -2091,7 +2497,7 @@ mod tests {
     #[test]
     fn help_center_has_four_real_pages_in_wide_and_small_terminals() {
         let mut ui = Ui::new(
-            Config::defaults(),
+            test_config(),
             AccountIndex::default(),
             None,
             Workspace::Accounts,
@@ -2116,7 +2522,7 @@ mod tests {
     #[test]
     fn editor_and_confirmation_fit_small_terminals() {
         let mut ui = Ui::new(
-            Config::defaults(),
+            test_config(),
             AccountIndex::default(),
             None,
             Workspace::Accounts,
@@ -2141,7 +2547,7 @@ mod tests {
     #[test]
     fn recent_events_scrolls_to_keep_the_selection_visible() {
         let mut ui = Ui::new(
-            Config::defaults(),
+            test_config(),
             AccountIndex::default(),
             None,
             Workspace::Proxy,
@@ -2158,6 +2564,7 @@ mod tests {
                 kind: format!("event-{index}"),
                 account_id: None,
                 detail: "safe metadata".into(),
+                message: None,
             })
             .collect();
         ui.event_selected = 11;
@@ -2174,5 +2581,35 @@ mod tests {
         assert_eq!(nice_axis_max(37), 50);
         assert_eq!(nice_axis_max(101), 200);
         assert_eq!(format_axis(500, 1000.0), "0.50 ┤");
+    }
+
+    #[test]
+    fn every_language_renders_the_header_and_selector_in_small_terminals() {
+        for preference in LanguagePreference::ALL.into_iter().skip(1) {
+            let mut config = test_config();
+            config.language = preference;
+            let mut ui = Ui::new(config, AccountIndex::default(), None, Workspace::Accounts);
+            ui.modal = Modal::LanguageSelector;
+            let screen = rendered_ui(48, 16, &ui);
+            assert!(screen.contains("[l]"), "{preference:?}: {screen}");
+            assert!(screen.contains("1"), "{preference:?}: {screen}");
+        }
+    }
+
+    #[test]
+    fn non_chinese_help_and_confirmation_use_the_selected_catalog() {
+        let mut config = test_config();
+        config.language = LanguagePreference::Es;
+        let mut ui = Ui::new(config, AccountIndex::default(), None, Workspace::Accounts);
+        ui.modal = Modal::Help;
+        ui.help_page = HelpPage::QuickStart;
+        let help = rendered_ui(100, 30, &ui);
+        assert!(help.contains("TRES PASOS"), "{help}");
+        assert!(!help.contains("三 步 开 始"), "{help}");
+
+        ui.open_confirmation(Modal::ConfirmDelete);
+        let confirmation = rendered_ui(72, 16, &ui);
+        assert!(confirmation.contains("Eliminar"), "{confirmation}");
+        assert!(!confirmation.contains("删 除 账 户"), "{confirmation}");
     }
 }

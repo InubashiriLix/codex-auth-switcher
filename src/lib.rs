@@ -3,6 +3,7 @@ pub mod account;
 pub mod config;
 pub mod error;
 pub(crate) mod filesystem;
+pub mod i18n;
 pub mod identity;
 pub mod integration;
 pub mod paths;

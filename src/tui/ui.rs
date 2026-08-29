@@ -1,6 +1,7 @@
 use crate::{
     config::Config,
     daemon::ControlSnapshot,
+    i18n::{Language, LanguagePreference, translate},
     proxy::{ProxyState, RuntimeState},
     storage::{MetricsWindow, RequestSummary, RuntimeEvent},
     types::{Account, AccountIndex, StatusKind},
@@ -84,6 +85,7 @@ pub enum Modal {
     ConfirmAutoSwitch,
     ConfirmExit,
     Onboarding,
+    LanguageSelector,
 }
 
 impl Modal {
@@ -121,12 +123,12 @@ pub enum HelpPage {
 impl HelpPage {
     pub const ALL: [Self; 4] = [Self::QuickStart, Self::Account, Self::Proxy, Self::Safety];
 
-    pub fn title(self) -> &'static str {
+    pub fn title(self, language: Language) -> String {
         match self {
-            Self::QuickStart => "快速开始",
-            Self::Account => "ACCOUNT",
-            Self::Proxy => "PROXY",
-            Self::Safety => "路由与安全",
+            Self::QuickStart => translate(language, "help-quick", None),
+            Self::Account => translate(language, "help-account", None),
+            Self::Proxy => translate(language, "help-proxy", None),
+            Self::Safety => translate(language, "help-safety", None),
         }
     }
 
@@ -332,6 +334,7 @@ pub struct Ui {
     pub instance_selected: usize,
     pub event_selected: usize,
     pub control_selected: usize,
+    pub language_selected: usize,
     pub onboarding_checked: bool,
     pub filter: String,
     pub modal: Modal,
@@ -371,10 +374,14 @@ impl Ui {
     ) -> Self {
         let attached_daemon = crate::daemon::read_runtime(&crate::paths::paths()).is_ok();
         let (action_sender, action_updates) = std::sync::mpsc::channel();
+        let language_selected = LanguagePreference::ALL
+            .iter()
+            .position(|language| *language == config.language)
+            .unwrap_or(0);
         let initial_notice = config
             .startup_notice
             .take()
-            .unwrap_or_else(|| "就绪".into());
+            .unwrap_or_else(|| translate(config.language.resolve(), "ready", None));
         let mut ui = Self {
             config,
             index,
@@ -383,6 +390,7 @@ impl Ui {
             instance_selected: 0,
             event_selected: 0,
             control_selected: 0,
+            language_selected,
             onboarding_checked: false,
             filter: String::new(),
             modal: Modal::None,
@@ -433,6 +441,22 @@ impl Ui {
         debug_assert!(modal.is_confirmation());
         self.modal = modal;
         self.confirm_choice = ConfirmChoice::Cancel;
+    }
+
+    pub fn language(&self) -> Language {
+        self.config.language.resolve()
+    }
+
+    pub fn tr(&self, id: &str) -> String {
+        translate(self.language(), id, None)
+    }
+
+    pub fn open_language_selector(&mut self) {
+        self.language_selected = LanguagePreference::ALL
+            .iter()
+            .position(|language| *language == self.config.language)
+            .unwrap_or(0);
+        self.modal = Modal::LanguageSelector;
     }
 
     pub fn open_help(&mut self) {

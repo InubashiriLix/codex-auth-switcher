@@ -1,7 +1,10 @@
 //! Metadata-only SQLite persistence. Request/response bodies and credentials
 //! are deliberately absent from this schema.
 
-use crate::error::{AppError, Result};
+use crate::{
+    error::{AppError, Result},
+    i18n::LocalizedMessage,
+};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
@@ -27,6 +30,8 @@ pub struct RequestSummary {
     pub response_bytes: u64,
     pub account_id: Option<Uuid>,
     pub route_reason: String,
+    #[serde(default)]
+    pub route_message: Option<LocalizedMessage>,
     pub retries: u32,
     pub partial_failure: bool,
 }
@@ -42,6 +47,8 @@ pub struct RuntimeEvent {
     pub account_id: Option<Uuid>,
     /// Must already be sanitized; storage also redacts common secret markers.
     pub detail: String,
+    #[serde(default)]
+    pub message: Option<LocalizedMessage>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -130,6 +137,20 @@ impl MetadataStore {
              CREATE INDEX IF NOT EXISTS events_occurred_at ON runtime_events(occurred_at DESC);",
             )
             .map_err(db_error)?;
+        ensure_column(
+            &connection,
+            "request_summaries",
+            "route_message_key",
+            "TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "request_summaries",
+            "route_message_args",
+            "TEXT",
+        )?;
+        ensure_column(&connection, "runtime_events", "message_key", "TEXT")?;
+        ensure_column(&connection, "runtime_events", "message_args", "TEXT")?;
         #[cfg(unix)]
         if path.exists() {
             use std::os::unix::fs::PermissionsExt;
@@ -145,13 +166,17 @@ impl MetadataStore {
 
     pub fn record_request(&self, summary: &RequestSummary) -> Result<()> {
         self.connection.lock().execute(
-            "INSERT OR REPLACE INTO request_summaries VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            "INSERT OR REPLACE INTO request_summaries
+             (id,tenant_id,device_id,client_instance_id,session_key,started_at,method,path,status,stage,duration_ms,ttfb_ms,request_bytes,response_bytes,account_id,route_reason,retries,partial_failure,route_message_key,route_message_args)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![summary.id, summary.tenant_id, summary.device_id, summary.client_instance_id,
                 summary.session_key, summary.started_at.to_rfc3339(), summary.method, summary.path,
                 summary.status, summary.stage, summary.duration_ms, summary.ttfb_ms,
                 summary.request_bytes, summary.response_bytes,
                 summary.account_id.map(|id| id.to_string()), summary.route_reason,
-                summary.retries, summary.partial_failure]
+                summary.retries, summary.partial_failure,
+                summary.route_message.as_ref().map(|message| message.key.as_str()),
+                summary.route_message.as_ref().and_then(|message| serde_json::to_string(&message.args).ok())]
         ).map_err(db_error)?;
         Ok(())
     }
@@ -160,7 +185,9 @@ impl MetadataStore {
         self.connection
             .lock()
             .execute(
-                "INSERT OR REPLACE INTO runtime_events VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                "INSERT OR REPLACE INTO runtime_events
+                 (id,occurred_at,tenant_id,device_id,client_instance_id,kind,account_id,detail,message_key,message_args)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     event.id,
                     event.occurred_at.to_rfc3339(),
@@ -169,7 +196,9 @@ impl MetadataStore {
                     event.client_instance_id,
                     event.kind,
                     event.account_id.map(|id| id.to_string()),
-                    sanitize(&event.detail)
+                    sanitize(&event.detail),
+                    event.message.as_ref().map(|message| message.key.as_str()),
+                    event.message.as_ref().and_then(|message| serde_json::to_string(&message.args).ok()).map(|args| sanitize(&args))
                 ],
             )
             .map_err(db_error)?;
@@ -218,7 +247,7 @@ impl MetadataStore {
     pub fn recent_events(&self, limit: usize, offset: usize) -> Result<Vec<RuntimeEvent>> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
-            "SELECT id,occurred_at,tenant_id,device_id,client_instance_id,kind,account_id,detail
+            "SELECT id,occurred_at,tenant_id,device_id,client_instance_id,kind,account_id,detail,message_key,message_args
              FROM runtime_events ORDER BY occurred_at DESC LIMIT ?1 OFFSET ?2",
         ).map_err(db_error)?;
         let rows = statement
@@ -236,6 +265,7 @@ impl MetadataStore {
                     kind: row.get(5)?,
                     account_id: account.and_then(|id| Uuid::parse_str(&id).ok()),
                     detail: row.get(7)?,
+                    message: localized_message(row.get(8)?, row.get(9)?),
                 })
             })
             .map_err(db_error)?;
@@ -256,7 +286,7 @@ impl MetadataStore {
             .prepare(
                 "SELECT id,tenant_id,device_id,client_instance_id,session_key,started_at,
                         method,path,status,stage,duration_ms,ttfb_ms,request_bytes,response_bytes,
-                        account_id,route_reason,retries,partial_failure
+                        account_id,route_reason,retries,partial_failure,route_message_key,route_message_args
                  FROM request_summaries ORDER BY started_at DESC LIMIT 50000",
             )
             .map_err(db_error)?;
@@ -285,7 +315,7 @@ impl MetadataStore {
                 .prepare(
                     "SELECT id,tenant_id,device_id,client_instance_id,session_key,started_at,
                             method,path,status,stage,duration_ms,ttfb_ms,request_bytes,response_bytes,
-                            account_id,route_reason,retries,partial_failure
+                            account_id,route_reason,retries,partial_failure,route_message_key,route_message_args
                      FROM request_summaries WHERE started_at >= ?1 ORDER BY started_at DESC",
                 )
                 .map_err(db_error)?;
@@ -396,8 +426,38 @@ fn request_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestSummary>
         response_bytes: row.get(13)?,
         account_id: account_id.and_then(|id| Uuid::parse_str(&id).ok()),
         route_reason: row.get(15)?,
+        route_message: localized_message(row.get(18)?, row.get(19)?),
         retries: row.get(16)?,
         partial_failure: row.get(17)?,
+    })
+}
+
+fn ensure_column(connection: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(db_error)?;
+    let exists = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(db_error)?
+        .filter_map(std::result::Result::ok)
+        .any(|name| name == column);
+    if !exists {
+        connection
+            .execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
+                [],
+            )
+            .map_err(db_error)?;
+    }
+    Ok(())
+}
+
+fn localized_message(key: Option<String>, args: Option<String>) -> Option<LocalizedMessage> {
+    key.map(|key| LocalizedMessage {
+        key,
+        args: args
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default(),
     })
 }
 
@@ -464,6 +524,7 @@ mod tests {
                     kind: "test".into(),
                     account_id: None,
                     detail: "safe".into(),
+                    message: None,
                 })
                 .unwrap();
         }
@@ -495,6 +556,7 @@ mod tests {
                     response_bytes: 0,
                     account_id: None,
                     route_reason: "test".into(),
+                    route_message: None,
                     retries: 0,
                     partial_failure: status >= 500,
                 })
@@ -516,6 +578,51 @@ mod tests {
                 .map(|bucket| bucket.requests)
                 .sum::<u64>(),
             3
+        );
+    }
+
+    #[test]
+    fn legacy_database_gains_localized_message_columns_without_losing_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-switcher-legacy-store-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE request_summaries (
+                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, device_id TEXT NOT NULL,
+                client_instance_id TEXT NOT NULL, session_key TEXT, started_at TEXT NOT NULL,
+                method TEXT NOT NULL, path TEXT NOT NULL, status INTEGER, stage TEXT NOT NULL,
+                duration_ms INTEGER, ttfb_ms INTEGER, request_bytes INTEGER NOT NULL,
+                response_bytes INTEGER NOT NULL, account_id TEXT, route_reason TEXT NOT NULL,
+                retries INTEGER NOT NULL, partial_failure INTEGER NOT NULL);
+             CREATE TABLE runtime_events (
+                id TEXT PRIMARY KEY, occurred_at TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                device_id TEXT NOT NULL, client_instance_id TEXT, kind TEXT NOT NULL,
+                account_id TEXT, detail TEXT NOT NULL);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = MetadataStore::open(&path, RetentionPolicy::default()).unwrap();
+        store
+            .record_event(&RuntimeEvent {
+                id: "localized".into(),
+                occurred_at: Utc::now(),
+                tenant_id: "local".into(),
+                device_id: "test".into(),
+                client_instance_id: None,
+                kind: "daemon_started".into(),
+                account_id: None,
+                detail: "legacy fallback".into(),
+                message: Some(LocalizedMessage::new("event-daemon-started")),
+            })
+            .unwrap();
+        let events = store.recent_events(10, 0).unwrap();
+        assert_eq!(
+            events[0].message.as_ref().unwrap().key,
+            "event-daemon-started"
         );
     }
 }

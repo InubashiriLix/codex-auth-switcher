@@ -2,6 +2,7 @@ use crate::{
     account::{activate, import_current, import_file, import_value, probe, save_index},
     config::{Config, save_config},
     error::*,
+    i18n::{translate, translate_with},
     paths::Paths,
     types::{Account, AccountIndex},
 };
@@ -23,7 +24,11 @@ pub fn import_current_auth(
 ) -> Result<String> {
     import_current(config, index)?;
     save_index(paths, index)?;
-    Ok("已导入当前认证".into())
+    Ok(translate(
+        config.language.resolve(),
+        "notice-imported-current",
+        None,
+    ))
 }
 
 /// 从文件路径导入
@@ -35,12 +40,20 @@ pub fn import_from_path(
 ) -> Result<String> {
     let p = Path::new(path);
     if !p.exists() {
-        return Err(AppError::Message(format!("文件不存在: {}", path)));
+        return Err(AppError::Message(translate_with(
+            config.language.resolve(),
+            "error-file-missing",
+            [("path", path)],
+        )));
     }
 
     import_file(config, index, p)?;
     save_index(paths, index)?;
-    Ok(format!("已导入: {}", path))
+    Ok(translate_with(
+        config.language.resolve(),
+        "notice-imported-path",
+        [("path", path)],
+    ))
 }
 
 /// 从JSON字符串导入
@@ -51,22 +64,36 @@ pub fn import_from_json(
     json_str: &str,
     name: Option<String>,
 ) -> Result<String> {
-    let value: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| AppError::Message(format!("JSON解析失败: {}", e)))?;
+    let value: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+        AppError::Message(translate_with(
+            config.language.resolve(),
+            "error-json",
+            [("error", e.to_string())],
+        ))
+    })?;
 
     import_value(config, index, value, "手动输入".into(), name)?;
     save_index(paths, index)?;
-    Ok("已导入JSON认证".into())
+    Ok(translate(
+        config.language.resolve(),
+        "notice-imported-json",
+        None,
+    ))
 }
 
 /// 激活账户
 pub fn activate_account(config: &Config, account: &Account) -> Result<String> {
     activate(config, account)?;
-    Ok(format!("已激活账户: {}", account.label))
+    Ok(translate_with(
+        config.language.resolve(),
+        "notice-activated",
+        [("account", account.label.as_str())],
+    ))
 }
 
 /// 重命名账户
 pub fn rename_account(
+    config: &Config,
     index: &mut AccountIndex,
     paths: &Paths,
     account_idx: usize,
@@ -76,9 +103,17 @@ pub fn rename_account(
         let old_name = account.label.clone();
         account.label = new_name.clone();
         save_index(paths, index)?;
-        Ok(format!("已重命名: {} → {}", old_name, new_name))
+        Ok(translate_with(
+            config.language.resolve(),
+            "notice-renamed",
+            [("from", old_name), ("to", new_name)],
+        ))
     } else {
-        Err(AppError::Message("账户不存在".into()))
+        Err(AppError::Message(translate(
+            config.language.resolve(),
+            "error-account-missing",
+            None,
+        )))
     }
 }
 
@@ -99,9 +134,17 @@ pub fn delete_account(
         }
 
         save_index(paths, index)?;
-        Ok(format!("已删除账户: {}", account.label))
+        Ok(translate_with(
+            config.language.resolve(),
+            "notice-deleted",
+            [("account", account.label)],
+        ))
     } else {
-        Err(AppError::Message("账户不存在".into()))
+        Err(AppError::Message(translate(
+            config.language.resolve(),
+            "error-account-missing",
+            None,
+        )))
     }
 }
 
@@ -116,9 +159,17 @@ pub fn probe_account(
         let label = account.label.clone();
         probe(config, account);
         save_index(paths, index)?;
-        Ok(format!("已检测账户: {}", label))
+        Ok(translate_with(
+            config.language.resolve(),
+            "notice-checked",
+            [("account", label)],
+        ))
     } else {
-        Err(AppError::Message("账户不存在".into()))
+        Err(AppError::Message(translate(
+            config.language.resolve(),
+            "error-account-missing",
+            None,
+        )))
     }
 }
 
@@ -133,13 +184,17 @@ pub fn probe_all_accounts(
         probe(config, account);
     }
     save_index(paths, index)?;
-    Ok(format!("已检测 {} 个账户", count))
+    Ok(translate_with(
+        config.language.resolve(),
+        "notice-checked-all",
+        [("count", count)],
+    ))
 }
 
 /// 保存配置
 pub fn save_current_config(paths: &Paths, config: &Config) -> Result<String> {
     save_config(paths, config)?;
-    Ok("配置已保存".into())
+    Ok(translate(config.language.resolve(), "config-saved", None))
 }
 
 /// 启动后台检测（非阻塞）
@@ -206,7 +261,11 @@ pub fn poll_probe(paths: &Paths, ui: &mut Ui) -> Result<()> {
 
     if finished {
         save_index(paths, &ui.index)?;
-        ui.notice = format!("检测完成：{} 个账户", total_count);
+        ui.notice = crate::i18n::translate_with(
+            ui.language(),
+            "notice-checked-all",
+            [("count", total_count.to_string())],
+        );
         ui.checking = None;
     }
 

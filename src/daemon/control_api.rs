@@ -2,6 +2,7 @@ use crate::{
     account::save_index,
     config::{Config, RecommendStrategy, save_config},
     error::{AppError, Result},
+    i18n::LanguagePreference,
     integration::CodexIntegration,
     paths::Paths,
     proxy::{ProxyRuntime, ProxyServer, ProxyState},
@@ -443,6 +444,9 @@ async fn handle(
                 if let Some(value) = patch.onboarding_acknowledged {
                     config.onboarding_acknowledged = value;
                 }
+                if let Some(value) = patch.language {
+                    config.language = value;
+                }
                 context
                     .proxy_server
                     .router()
@@ -695,6 +699,7 @@ struct ConfigPatch {
     threshold: Option<f64>,
     strategy: Option<RecommendStrategy>,
     onboarding_acknowledged: Option<bool>,
+    language: Option<LanguagePreference>,
 }
 #[derive(Deserialize)]
 struct PoolPatch {
@@ -762,6 +767,10 @@ fn record_control_event(
             kind: kind.into(),
             account_id,
             detail: detail.into(),
+            message: Some(crate::i18n::LocalizedMessage::new(format!(
+                "event-{}",
+                kind.replace('_', "-")
+            ))),
         });
 }
 
