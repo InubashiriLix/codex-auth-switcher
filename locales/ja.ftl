@@ -175,6 +175,7 @@ cli-about = プロキシ対応 Codex 認証マネージャー
 cli-proxy = TUI 付きプロキシモードを有効化
 cli-auto-switch = プロキシモードで自動切替を有効化
 cli-daemon = TUI なしのバックグラウンドデーモンとして実行
+cli-force-ascii = 対話 TUI を純粋な ASCII 表示に固定
 cli-daemon-status = デーモン状態を確認
 cli-daemon-stop = デーモンを安全に停止
 cli-daemon-reload = デーモン設定をホットリロード

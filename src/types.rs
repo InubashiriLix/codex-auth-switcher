@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Account {
     pub id: Uuid,
     pub label: String,
@@ -28,7 +28,7 @@ fn default_tenant_id() -> String {
     "local".into()
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CheckStatus {
     pub kind: StatusKind,
     pub checked_at: Option<DateTime<Utc>>,
@@ -59,14 +59,14 @@ pub enum StatusKind {
     Unknown,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Quota {
     pub used_percent: f64,
     pub window_minutes: Option<u64>,
     pub resets_at: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 pub struct AccountIndex {
     #[serde(default)]
     pub accounts: Vec<Account>,
@@ -80,6 +80,19 @@ pub enum Theme {
     Nord,
     Gruvbox,
     Paper,
+}
+
+/// Terminal glyph policy for the interactive TUI.
+///
+/// `Auto` preserves the rich interface on UTF-8 terminals and falls back to
+/// plain ASCII for known legacy terminal environments.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalMode {
+    #[default]
+    Auto,
+    Unicode,
+    Ascii,
 }
 
 impl Theme {

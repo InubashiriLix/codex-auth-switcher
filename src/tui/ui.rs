@@ -4,7 +4,7 @@ use crate::{
     i18n::{Language, LanguagePreference, translate},
     proxy::{ProxyState, RuntimeState},
     storage::{MetricsWindow, RequestSummary, RuntimeEvent},
-    types::{Account, AccountIndex, StatusKind},
+    types::{Account, AccountIndex, StatusKind, TerminalMode},
 };
 use std::{
     collections::VecDeque,
@@ -22,6 +22,20 @@ pub enum Workspace {
     #[default]
     Accounts,
     Proxy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RenderMode {
+    #[default]
+    Unicode,
+    Ascii,
+}
+
+impl RenderMode {
+    pub fn resolve(_configured: TerminalMode, _force_tty_mode: bool) -> Self {
+        // Interactive ratatui is always the full Unicode/color presentation.
+        Self::Unicode
+    }
 }
 
 impl Workspace {
@@ -75,6 +89,7 @@ pub enum Modal {
     Rename,
     ConfirmUseEmail,
     Settings,
+    ConfigPage,
     ConfirmDelete,
     Help,
     ModeSelector,
@@ -86,6 +101,14 @@ pub enum Modal {
     ConfirmExit,
     Onboarding,
     LanguageSelector,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsGroup {
+    #[default]
+    General,
+    Proxy,
+    Storage,
 }
 
 impl Modal {
@@ -328,6 +351,8 @@ pub enum ActionUpdate {
 
 pub struct Ui {
     pub config: Config,
+    pub render_mode: RenderMode,
+    pub forced_tty: bool,
     pub index: AccountIndex,
     pub selected: usize,
     pub pool_selected: usize,
@@ -350,6 +375,14 @@ pub struct Ui {
     pub workspace: Workspace,
     pub proxy_panel: ProxyPanel,
     pub attached_daemon: bool,
+    /// Local account edits are held until a daemon snapshot confirms them.
+    pub pending_index_sync: bool,
+    pub start_after_probe: bool,
+    pub settings_group: SettingsGroup,
+    pub settings_selected: usize,
+    pub settings_draft: Config,
+    pub settings_dirty: bool,
+    pub settings_query: String,
     pub owned_daemon: Option<JoinHandle<crate::Result<()>>>,
     pub control_updates: Option<Receiver<ControlUpdate>>,
     pub control_stop: Arc<AtomicBool>,
@@ -363,14 +396,27 @@ pub struct Ui {
     pub request_history: VecDeque<u64>,
     pub failure_history: VecDeque<u64>,
     pub ttfb_history: VecDeque<u64>,
+    pub rps_axis_max: u64,
+    pub ttfb_axis_max: u64,
 }
 
 impl Ui {
     pub fn new(
+        config: Config,
+        index: AccountIndex,
+        proxy_state: Option<ProxyState>,
+        workspace: Workspace,
+    ) -> Self {
+        let render_mode = RenderMode::resolve(config.terminal_mode, false);
+        Self::new_with_render_mode(config, index, proxy_state, workspace, render_mode)
+    }
+
+    pub fn new_with_render_mode(
         mut config: Config,
         index: AccountIndex,
         proxy_state: Option<ProxyState>,
         workspace: Workspace,
+        render_mode: RenderMode,
     ) -> Self {
         let attached_daemon = crate::daemon::read_runtime(&crate::paths::paths()).is_ok();
         let (action_sender, action_updates) = std::sync::mpsc::channel();
@@ -383,7 +429,9 @@ impl Ui {
             .take()
             .unwrap_or_else(|| translate(config.language.resolve(), "ready", None));
         let mut ui = Self {
-            config,
+            config: config.clone(),
+            render_mode,
+            forced_tty: false,
             index,
             selected: 0,
             pool_selected: 0,
@@ -410,6 +458,13 @@ impl Ui {
             workspace,
             proxy_panel: ProxyPanel::Control,
             attached_daemon,
+            pending_index_sync: false,
+            start_after_probe: false,
+            settings_group: SettingsGroup::General,
+            settings_selected: 0,
+            settings_draft: config.clone(),
+            settings_dirty: false,
+            settings_query: String::new(),
             owned_daemon: None,
             control_updates: None,
             control_stop: Arc::new(AtomicBool::new(false)),
@@ -423,6 +478,8 @@ impl Ui {
             request_history: VecDeque::with_capacity(30),
             failure_history: VecDeque::with_capacity(30),
             ttfb_history: VecDeque::with_capacity(30),
+            rps_axis_max: 1_000,
+            ttfb_axis_max: 100,
         };
         if workspace == Workspace::Proxy && !attached_daemon && ui.needs_onboarding() {
             ui.modal = Modal::Onboarding;
@@ -444,7 +501,11 @@ impl Ui {
     }
 
     pub fn language(&self) -> Language {
-        self.config.language.resolve()
+        if self.render_mode == RenderMode::Ascii {
+            Language::En
+        } else {
+            self.config.language.resolve()
+        }
     }
 
     pub fn tr(&self, id: &str) -> String {
@@ -452,6 +513,10 @@ impl Ui {
     }
 
     pub fn open_language_selector(&mut self) {
+        if self.render_mode == RenderMode::Ascii {
+            self.notice = "ASCII mode uses English".into();
+            return;
+        }
         self.language_selected = LanguagePreference::ALL
             .iter()
             .position(|language| *language == self.config.language)
@@ -467,6 +532,15 @@ impl Ui {
         };
         self.help_scroll = 0;
         self.modal = Modal::Help;
+    }
+
+    pub fn open_settings(&mut self) {
+        self.settings_draft = self.config.clone();
+        self.settings_group = SettingsGroup::General;
+        self.settings_selected = 0;
+        self.settings_dirty = false;
+        self.settings_query.clear();
+        self.modal = Modal::ConfigPage;
     }
 
     pub fn visible(&self) -> Vec<usize> {
@@ -488,13 +562,30 @@ impl Ui {
             .collect()
     }
 
+    pub fn pool_visible(&self) -> Vec<usize> {
+        let query = self.filter.to_lowercase();
+        self.index
+            .accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, account)| {
+                query.is_empty()
+                    || fuzzy_subsequence(&account.label, &query)
+                    || account
+                        .email
+                        .as_deref()
+                        .is_some_and(|email| fuzzy_subsequence(email, &query))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     pub fn selected_id(&self) -> Option<usize> {
         self.visible().get(self.selected).copied()
     }
 
     pub fn pool_selected_id(&self) -> Option<usize> {
-        (!self.index.accounts.is_empty())
-            .then(|| self.pool_selected.min(self.index.accounts.len() - 1))
+        self.pool_visible().get(self.pool_selected).copied()
     }
 
     pub fn runtime_state(&self) -> RuntimeState {
@@ -590,12 +681,55 @@ impl Ui {
             }
             history.push_back(value);
         }
+        self.refresh_chart_axes();
+    }
+
+    pub fn refresh_chart_axes(&mut self) {
+        self.rps_axis_max = stable_axis_max(&self.request_history, self.rps_axis_max, 1_000);
+        self.ttfb_axis_max = stable_axis_max(&self.ttfb_history, self.ttfb_axis_max, 100);
     }
 
     pub fn clamp_event_selection(&mut self) {
         let length = self.recent_requests.len() + self.recent_events.len();
         self.event_selected = self.event_selected.min(length.saturating_sub(1));
     }
+}
+
+fn fuzzy_subsequence(value: &str, query: &str) -> bool {
+    let mut chars = value.chars().flat_map(char::to_lowercase);
+    query
+        .chars()
+        .flat_map(char::to_lowercase)
+        .all(|needle| chars.by_ref().any(|candidate| candidate == needle))
+}
+
+fn stable_axis_max(history: &VecDeque<u64>, previous: u64, minimum: u64) -> u64 {
+    let observed = history.iter().copied().max().unwrap_or(0).max(minimum);
+    let target = nice_axis_max(observed);
+    if previous < target {
+        target
+    } else if target.saturating_mul(2) < previous {
+        // The historical peak has left the fixed-size window, so reclaim
+        // headroom once rather than shrinking on ordinary bucket updates.
+        target
+    } else {
+        previous.max(minimum)
+    }
+}
+
+fn nice_axis_max(value: u64) -> u64 {
+    if value <= 1 {
+        return 1;
+    }
+    let magnitude = 10u64.pow(value.ilog10());
+    let normalized = value.div_ceil(magnitude);
+    let step = match normalized {
+        0..=1 => 1,
+        2 => 2,
+        3..=5 => 5,
+        _ => 10,
+    };
+    step * magnitude
 }
 
 use crate::error::Result;
@@ -611,9 +745,12 @@ pub fn run_interactive_tui(
     index: AccountIndex,
     proxy_state: Option<ProxyState>,
     workspace: Workspace,
+    force_tty_mode: bool,
 ) -> Result<()> {
     let paths = crate::paths::paths();
-    let mut ui = Ui::new(config, index, proxy_state, workspace);
+    let render_mode = RenderMode::resolve(config.terminal_mode, force_tty_mode);
+    let mut ui = Ui::new_with_render_mode(config, index, proxy_state, workspace, render_mode);
+    ui.forced_tty = force_tty_mode;
 
     enable_raw_mode()?;
     let mut out = io::stdout();
@@ -691,5 +828,28 @@ mod tests {
         ui.confirm_choice = ConfirmChoice::Confirm;
         ui.open_confirmation(Modal::ConfirmDelete);
         assert_eq!(ui.confirm_choice, ConfirmChoice::Cancel);
+    }
+
+    #[test]
+    fn ascii_mode_forces_english_without_mutating_saved_preference() {
+        let mut config = Config::defaults();
+        config.language = LanguagePreference::ZhCn;
+        let ui = Ui::new_with_render_mode(
+            config,
+            AccountIndex::default(),
+            None,
+            Workspace::Accounts,
+            RenderMode::Ascii,
+        );
+        assert_eq!(ui.language(), Language::En);
+        assert_eq!(ui.config.language, LanguagePreference::ZhCn);
+    }
+
+    #[test]
+    fn chart_axis_only_shrinks_after_the_old_peak_leaves_history() {
+        let history = [10_000, 500].into_iter().collect();
+        assert_eq!(stable_axis_max(&history, 1_000, 1), 10_000);
+        let settled = [500, 400].into_iter().collect();
+        assert_eq!(stable_axis_max(&settled, 10_000, 1), 500);
     }
 }

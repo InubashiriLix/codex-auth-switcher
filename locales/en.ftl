@@ -175,6 +175,7 @@ cli-about = Codex authentication manager with proxy support
 cli-proxy = Enable proxy mode with the TUI
 cli-auto-switch = Enable automatic switching in proxy mode
 cli-daemon = Run as a background daemon without the TUI
+cli-force-ascii = Force the interactive TUI to use pure ASCII
 cli-daemon-status = Check daemon status
 cli-daemon-stop = Stop the daemon gracefully
 cli-daemon-reload = Hot-reload daemon configuration

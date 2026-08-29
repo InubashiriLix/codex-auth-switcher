@@ -175,6 +175,7 @@ cli-about = Gestore autenticazione Codex con supporto proxy
 cli-proxy = Attiva la modalità proxy con TUI
 cli-auto-switch = Attiva il cambio automatico in modalità proxy
 cli-daemon = Esegui come demone in background senza TUI
+cli-force-ascii = Forza la TUI interattiva a usare ASCII puro
 cli-daemon-status = Controlla lo stato del demone
 cli-daemon-stop = Arresta correttamente il demone
 cli-daemon-reload = Ricarica la configurazione del demone

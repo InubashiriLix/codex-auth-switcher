@@ -60,7 +60,9 @@ pub fn handle_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
     if ui.modal != Modal::None {
         return handle_modal(key, paths, ui);
     }
-    if key.code == KeyCode::Char('l') {
+    if key.code == KeyCode::Char('l')
+        && !(ui.workspace == Workspace::Proxy && ui.proxy_panel == ProxyPanel::Pool)
+    {
         ui.open_language_selector();
         return Ok(false);
     }
@@ -75,6 +77,10 @@ pub fn handle_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
     }
     if key.code == KeyCode::Char('m') {
         ui.modal = Modal::ModeSelector;
+        return Ok(false);
+    }
+    if key.code == KeyCode::Char(',') {
+        ui.open_settings();
         return Ok(false);
     }
     if key.code == KeyCode::Char('?') {
@@ -194,6 +200,9 @@ fn handle_account_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool>
         KeyCode::Char('a') => {
             ui.notice = import_current_auth(&ui.config, &mut ui.index, paths)
                 .unwrap_or_else(|error| error.to_string());
+            if ui.attached_daemon && !ui.notice.starts_with("错误") {
+                ui.pending_index_sync = true;
+            }
         }
         KeyCode::Char('i') => {
             ui.open_text_editor(Modal::Import, String::new());
@@ -248,6 +257,8 @@ fn handle_account_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool>
 
 fn handle_proxy_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
     match key.code {
+        KeyCode::Char('h') => ui.proxy_panel = ui.proxy_panel.previous(),
+        KeyCode::Char('l') => ui.proxy_panel = ui.proxy_panel.next(),
         KeyCode::Tab => ui.proxy_panel = ui.proxy_panel.next(),
         KeyCode::BackTab => ui.proxy_panel = ui.proxy_panel.previous(),
         KeyCode::Char('1') => ui.proxy_panel = ProxyPanel::Control,
@@ -256,6 +267,10 @@ fn handle_proxy_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
         KeyCode::Char('4') => ui.proxy_panel = ProxyPanel::Events,
         KeyCode::Char('j') => move_proxy_selection(ui, true),
         KeyCode::Char('k') => move_proxy_selection(ui, false),
+        KeyCode::Char('/') if ui.proxy_panel == ProxyPanel::Pool => {
+            ui.open_text_editor(Modal::Filter, ui.filter.clone());
+            refresh_completions(ui);
+        }
         KeyCode::Enter => open_proxy_detail(ui),
         KeyCode::Char(' ') if ui.proxy_panel == ProxyPanel::Pool => toggle_pool(paths, ui),
         KeyCode::Char('r') if ui.proxy_panel == ProxyPanel::Pool => {
@@ -303,9 +318,10 @@ fn handle_proxy_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
 }
 
 fn move_proxy_selection(ui: &mut Ui, down: bool) {
+    let pool_len = ui.pool_visible().len();
     let (selected, length) = match ui.proxy_panel {
         ProxyPanel::Control => (&mut ui.control_selected, 7),
-        ProxyPanel::Pool => (&mut ui.pool_selected, ui.index.accounts.len()),
+        ProxyPanel::Pool => (&mut ui.pool_selected, pool_len),
         ProxyPanel::Instances => (
             &mut ui.instance_selected,
             ui.snapshot
@@ -424,6 +440,21 @@ fn start_proxy(paths: &Paths, ui: &mut Ui) {
             }
         } else {
             ui.notice = ui.tr("notice-embedded-starting-wait");
+            return;
+        }
+    }
+    if ui.attached_daemon && ui.checking.is_none() {
+        let pool = ui
+            .index
+            .accounts
+            .iter()
+            .filter(|account| account.proxy_enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !pool.is_empty() {
+            ui.start_after_probe = true;
+            start_probe(ui, pool);
+            ui.notice = ui.tr("notice-checking-all");
             return;
         }
     }
@@ -616,6 +647,9 @@ fn handle_modal(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
         handle_help_key(key, ui);
         return Ok(false);
     }
+    if ui.modal == Modal::ConfigPage {
+        return handle_settings_key(key, paths, ui);
+    }
     if ui.modal.is_confirmation() {
         return handle_confirmation_key(key, paths, ui);
     }
@@ -658,6 +692,69 @@ fn handle_modal(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
             _ => {}
         },
         Modal::LanguageSelector => handle_language_selector_key(key, paths, ui),
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_settings_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
+    use crate::tui::ui::SettingsGroup;
+    match key.code {
+        KeyCode::Esc => ui.modal = Modal::None,
+        KeyCode::Tab => {
+            ui.settings_group = match ui.settings_group {
+                SettingsGroup::General => SettingsGroup::Proxy,
+                SettingsGroup::Proxy => SettingsGroup::Storage,
+                SettingsGroup::Storage => SettingsGroup::General,
+            };
+            ui.settings_selected = 0;
+        }
+        KeyCode::Char('/') => ui.settings_query.clear(),
+        KeyCode::Backspace => {
+            ui.settings_query.pop();
+            ui.settings_selected = 0;
+        }
+        KeyCode::Char(c) if !matches!(c, 'a' | 'j' | 'k' | ' ') => {
+            ui.settings_query.push(c);
+            ui.settings_selected = 0;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            ui.settings_selected = ui.settings_selected.saturating_sub(1)
+        }
+        KeyCode::Down | KeyCode::Char('j') => ui.settings_selected += 1,
+        KeyCode::Char(' ') => {
+            if matches!(ui.settings_group, SettingsGroup::Proxy) && ui.settings_selected == 1 {
+                ui.settings_draft.proxy.auto_switch = !ui.settings_draft.proxy.auto_switch;
+                ui.settings_dirty = true;
+            }
+        }
+        KeyCode::Enter => {
+            if matches!(ui.settings_group, SettingsGroup::General) && ui.settings_selected == 0 {
+                ui.settings_draft.theme = ui.settings_draft.theme.next();
+                ui.settings_dirty = true;
+            } else if matches!(ui.settings_group, SettingsGroup::Proxy) && ui.settings_selected == 3
+            {
+                ui.settings_draft.proxy.strategy = match ui.settings_draft.proxy.strategy {
+                    crate::config::RecommendStrategy::Smart => {
+                        crate::config::RecommendStrategy::MaxRemaining
+                    }
+                    crate::config::RecommendStrategy::MaxRemaining => {
+                        crate::config::RecommendStrategy::RoundRobin
+                    }
+                    crate::config::RecommendStrategy::RoundRobin => {
+                        crate::config::RecommendStrategy::Smart
+                    }
+                };
+                ui.settings_dirty = true;
+            }
+        }
+        KeyCode::Char('a') if ui.settings_dirty => {
+            crate::config::save_config(paths, &ui.settings_draft)?;
+            ui.config = ui.settings_draft.clone();
+            ui.settings_dirty = false;
+            ui.notice = ui.tr("config-saved");
+            ui.modal = Modal::None;
+        }
         _ => {}
     }
     Ok(false)
@@ -772,6 +869,9 @@ fn execute_confirmation(paths: &Paths, ui: &mut Ui, confirmed: bool) -> Result<b
             if let Some(index) = ui.selected_id() {
                 ui.notice = delete_account(&ui.config, &mut ui.index, paths, index)
                     .unwrap_or_else(|error| error.to_string());
+                if ui.attached_daemon && ui.notice != ui.tr("error-account-missing") {
+                    ui.pending_index_sync = true;
+                }
                 ui.selected = ui.selected.saturating_sub(1);
             }
         }
@@ -781,6 +881,9 @@ fn execute_confirmation(paths: &Paths, ui: &mut Ui, confirmed: bool) -> Result<b
             {
                 ui.notice = rename_account(&ui.config, &mut ui.index, paths, index, email)
                     .unwrap_or_else(|error| error.to_string());
+                if ui.attached_daemon {
+                    ui.pending_index_sync = true;
+                }
             }
         }
         Modal::ConfirmProxyStart => start_proxy(paths, ui),
@@ -852,6 +955,7 @@ fn submit_text_editor(paths: &Paths, ui: &mut Ui) {
         Modal::Filter => {
             ui.filter.clone_from(&value);
             ui.selected = 0;
+            ui.pool_selected = 0;
             Ok(if ui.filter.is_empty() {
                 ui.tr("notice-filter-cleared")
             } else {
@@ -865,18 +969,24 @@ fn submit_text_editor(paths: &Paths, ui: &mut Ui) {
         Modal::Rename if value.trim().is_empty() => {
             Err(AppError::Message(ui.tr("error-empty-account-name")))
         }
-        Modal::Rename => ui
-            .selected_id()
-            .ok_or_else(|| AppError::Message(ui.tr("error-account-missing")))
-            .and_then(|index| {
-                rename_account(
-                    &ui.config,
-                    &mut ui.index,
-                    paths,
-                    index,
-                    value.trim().to_string(),
-                )
-            }),
+        Modal::Rename => {
+            let result = ui
+                .selected_id()
+                .ok_or_else(|| AppError::Message(ui.tr("error-account-missing")))
+                .and_then(|index| {
+                    rename_account(
+                        &ui.config,
+                        &mut ui.index,
+                        paths,
+                        index,
+                        value.trim().to_string(),
+                    )
+                });
+            if result.is_ok() && ui.attached_daemon {
+                ui.pending_index_sync = true;
+            }
+            result
+        }
         Modal::Settings => {
             let path = PathBuf::from(value.trim());
             if path.as_os_str().is_empty() {

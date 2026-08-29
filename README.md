@@ -61,6 +61,17 @@ language = "auto"
 
 Automatic detection checks `LC_ALL`, `LC_MESSAGES`, then `LANG`. Unsupported locales fall back to English. The header always shows the effective language as `🌐 [l] English`.
 
+### Legacy and ASCII terminals
+
+The TUI normally uses Unicode box drawing and high-resolution charts. It automatically switches to ASCII when `TERM=dumb` or the active locale is non-UTF-8. Override that choice persistently with `terminal_mode = "auto" | "unicode" | "ascii"`, or for one invocation use:
+
+```bash
+codex-switcher --force-ascii
+codex-switcher --proxy --force-ascii
+```
+
+ASCII mode uses English and emits only ASCII characters, including live charts, so it remains usable over constrained TTY and serial connections.
+
 ## TUI keys
 
 | Key                          | Action                                                          |

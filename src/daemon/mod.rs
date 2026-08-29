@@ -5,7 +5,8 @@ mod notifications;
 pub mod windows_service;
 
 pub use control::{
-    check_daemon_status, remove_pid_file, send_reload_signal, send_stop_signal, write_pid_file,
+    DaemonStatus, check_daemon_status, remove_pid_file, send_reload_signal, send_stop_signal,
+    write_pid_file,
 };
 pub use control_api::{
     AccountRuntimeSnapshot, Alert, ControlContext, ControlServer, ControlSnapshot, HealthSnapshot,
