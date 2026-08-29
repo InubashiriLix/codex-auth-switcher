@@ -86,6 +86,215 @@ pub enum Modal {
     Onboarding,
 }
 
+impl Modal {
+    pub fn is_text_editor(self) -> bool {
+        matches!(
+            self,
+            Self::Import | Self::Filter | Self::Rename | Self::Settings
+        )
+    }
+
+    pub fn is_confirmation(self) -> bool {
+        matches!(
+            self,
+            Self::ConfirmUseEmail
+                | Self::ConfirmDelete
+                | Self::ConfirmIntegrationEnable
+                | Self::ConfirmIntegrationDisable
+                | Self::ConfirmProxyStart
+                | Self::ConfirmProxyStop
+                | Self::ConfirmAutoSwitch
+                | Self::ConfirmExit
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HelpPage {
+    QuickStart,
+    #[default]
+    Account,
+    Proxy,
+    Safety,
+}
+
+impl HelpPage {
+    pub const ALL: [Self; 4] = [Self::QuickStart, Self::Account, Self::Proxy, Self::Safety];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::QuickStart => "快速开始",
+            Self::Account => "ACCOUNT",
+            Self::Proxy => "PROXY",
+            Self::Safety => "路由与安全",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        Self::ALL[(self as usize + 1) % Self::ALL.len()]
+    }
+
+    pub fn previous(self) -> Self {
+        Self::ALL[(self as usize + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    pub fn max_scroll(self) -> u16 {
+        match self {
+            Self::QuickStart => 30,
+            Self::Account => 24,
+            Self::Proxy => 34,
+            Self::Safety => 30,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConfirmChoice {
+    #[default]
+    Cancel,
+    Confirm,
+}
+
+impl ConfirmChoice {
+    pub fn toggle(&mut self) {
+        *self = match self {
+            Self::Cancel => Self::Confirm,
+            Self::Confirm => Self::Cancel,
+        };
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputSuggestion {
+    pub display: String,
+    pub value: String,
+    pub directory: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TextEditorState {
+    pub value: String,
+    /// UTF-8 byte offset, always kept on a character boundary.
+    pub cursor: usize,
+    pub suggestions: Vec<InputSuggestion>,
+    pub suggestion_index: usize,
+    pub error: Option<String>,
+}
+
+impl TextEditorState {
+    pub fn reset(&mut self, value: impl Into<String>) {
+        self.value = value.into();
+        self.cursor = self.value.len();
+        self.suggestions.clear();
+        self.suggestion_index = 0;
+        self.error = None;
+    }
+
+    pub fn clear(&mut self) {
+        self.reset(String::new());
+    }
+
+    pub fn insert(&mut self, character: char) {
+        self.value.insert(self.cursor, character);
+        self.cursor += character.len_utf8();
+        self.error = None;
+    }
+
+    pub fn move_left(&mut self) {
+        self.cursor = previous_boundary(&self.value, self.cursor);
+    }
+
+    pub fn move_right(&mut self) {
+        self.cursor = next_boundary(&self.value, self.cursor);
+    }
+
+    pub fn backspace(&mut self) {
+        let previous = previous_boundary(&self.value, self.cursor);
+        if previous != self.cursor {
+            self.value.drain(previous..self.cursor);
+            self.cursor = previous;
+            self.error = None;
+        }
+    }
+
+    pub fn delete(&mut self) {
+        let next = next_boundary(&self.value, self.cursor);
+        if next != self.cursor {
+            self.value.drain(self.cursor..next);
+            self.error = None;
+        }
+    }
+
+    pub fn delete_previous_word(&mut self) {
+        let mut start = self.cursor;
+        while start > 0 {
+            let previous = previous_boundary(&self.value, start);
+            let character = self.value[previous..start].chars().next().unwrap_or(' ');
+            if !character.is_whitespace() {
+                break;
+            }
+            start = previous;
+        }
+        while start > 0 {
+            let previous = previous_boundary(&self.value, start);
+            let character = self.value[previous..start].chars().next().unwrap_or(' ');
+            if character.is_whitespace() {
+                break;
+            }
+            start = previous;
+        }
+        self.value.drain(start..self.cursor);
+        self.cursor = start;
+        self.error = None;
+    }
+
+    pub fn kill_before_cursor(&mut self) {
+        self.value.drain(..self.cursor);
+        self.cursor = 0;
+        self.error = None;
+    }
+
+    pub fn kill_after_cursor(&mut self) {
+        self.value.truncate(self.cursor);
+        self.error = None;
+    }
+
+    pub fn next_suggestion(&mut self) {
+        if !self.suggestions.is_empty() {
+            self.suggestion_index = (self.suggestion_index + 1) % self.suggestions.len();
+        }
+    }
+
+    pub fn previous_suggestion(&mut self) {
+        if !self.suggestions.is_empty() {
+            self.suggestion_index =
+                (self.suggestion_index + self.suggestions.len() - 1) % self.suggestions.len();
+        }
+    }
+
+    pub fn accept_suggestion(&mut self) {
+        if let Some(suggestion) = self.suggestions.get(self.suggestion_index) {
+            self.value.clone_from(&suggestion.value);
+            self.cursor = self.value.len();
+            self.error = None;
+        }
+    }
+}
+
+fn previous_boundary(value: &str, cursor: usize) -> usize {
+    value[..cursor]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+fn next_boundary(value: &str, cursor: usize) -> usize {
+    value[cursor..]
+        .char_indices()
+        .nth(1)
+        .map_or(value.len(), |(index, _)| cursor + index)
+}
+
 pub struct Checking {
     pub receiver: Receiver<ProbeEvent>,
     pub total: usize,
@@ -127,7 +336,10 @@ pub struct Ui {
     pub filter: String,
     pub modal: Modal,
     pub detail: Option<DetailPage>,
-    pub input: String,
+    pub editor: TextEditorState,
+    pub help_page: HelpPage,
+    pub help_scroll: u16,
+    pub confirm_choice: ConfirmChoice,
     pub notice: String,
     pub tick: u64,
     pub proxy_state: Option<ProxyState>,
@@ -175,7 +387,14 @@ impl Ui {
             filter: String::new(),
             modal: Modal::None,
             detail: None,
-            input: String::new(),
+            editor: TextEditorState::default(),
+            help_page: if workspace == Workspace::Proxy {
+                HelpPage::Proxy
+            } else {
+                HelpPage::Account
+            },
+            help_scroll: 0,
+            confirm_choice: ConfirmChoice::Cancel,
             notice: initial_notice,
             tick: 0,
             proxy_state,
@@ -202,6 +421,28 @@ impl Ui {
             ui.onboarding_checked = true;
         }
         ui
+    }
+
+    pub fn open_text_editor(&mut self, modal: Modal, value: impl Into<String>) {
+        debug_assert!(modal.is_text_editor());
+        self.modal = modal;
+        self.editor.reset(value);
+    }
+
+    pub fn open_confirmation(&mut self, modal: Modal) {
+        debug_assert!(modal.is_confirmation());
+        self.modal = modal;
+        self.confirm_choice = ConfirmChoice::Cancel;
+    }
+
+    pub fn open_help(&mut self) {
+        self.help_page = if self.workspace == Workspace::Proxy {
+            HelpPage::Proxy
+        } else {
+            HelpPage::Account
+        };
+        self.help_scroll = 0;
+        self.modal = Modal::Help;
     }
 
     pub fn visible(&self) -> Vec<usize> {
@@ -397,5 +638,34 @@ mod tests {
 
         ui.config.onboarding_acknowledged = false;
         assert!(ui.needs_onboarding());
+    }
+
+    #[test]
+    fn text_editor_keeps_a_utf8_safe_cursor() {
+        let mut editor = TextEditorState::default();
+        editor.reset("你a");
+        editor.move_left();
+        editor.insert('好');
+        assert_eq!(editor.value, "你好a");
+        assert_eq!(editor.cursor, "你好".len());
+
+        editor.backspace();
+        assert_eq!(editor.value, "你a");
+        editor.delete_previous_word();
+        assert_eq!(editor.value, "a");
+        assert_eq!(editor.cursor, 0);
+    }
+
+    #[test]
+    fn confirmation_always_opens_on_the_safe_choice() {
+        let mut ui = Ui::new(
+            Config::defaults(),
+            AccountIndex::default(),
+            None,
+            Workspace::Accounts,
+        );
+        ui.confirm_choice = ConfirmChoice::Confirm;
+        ui.open_confirmation(Modal::ConfirmDelete);
+        assert_eq!(ui.confirm_choice, ConfirmChoice::Cancel);
     }
 }
