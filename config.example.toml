@@ -1,6 +1,7 @@
 # Codex Switcher 配置示例 / Example Configuration
-# 复制到 ~/.config/codex-switcher/config.toml 并根据需要修改
-# Copy to ~/.config/codex-switcher/config.toml and modify as needed
+# Linux: copy to ~/.config/codex-switcher/config.toml.
+# Windows: copy to %APPDATA%\CodexSwitcher\config.toml.
+# 复制后根据需要修改 / Copy and modify as needed.
 
 # Codex CLI 主目录
 codex_home = "/home/user/.codex"

@@ -88,7 +88,19 @@ systemctl --user daemon-reload
 systemctl --user enable --now codex-switcher.service
 ```
 
-Linux is the currently verified platform. macOS and Windows code paths exist but still need real-world testing and platform-specific service integration.
+## Windows (x86_64)
+
+Windows 10/11 x86_64 is supported through the portable `codex-switcher.exe` and the unsigned MSI release. Interactive state uses `%APPDATA%\CodexSwitcher` and `%LOCALAPPDATA%\CodexSwitcher`; the default Codex directory is `%USERPROFILE%\.codex`.
+
+The MSI installs the executable, registers a demand-start LocalService daemon, and prepares `C:\ProgramData\CodexSwitcher`. To configure and start that daemon, open an elevated PowerShell and provide the exact Codex directory it may access:
+
+```powershell
+& 'C:\Program Files\Codex Switcher\codex-switcher.exe' service install `
+  --service-root 'C:\ProgramData\CodexSwitcher' `
+  --codex-home "$env:USERPROFILE\.codex"
+```
+
+Use `service status`, `service stop`, and `service uninstall` to manage it. The service cannot display desktop notifications; switch events remain available through the TUI and runtime history. The installer is not Authenticode-signed yet, so Windows will show an unknown-publisher warning.
 
 ## Security boundary
 

@@ -2,6 +2,7 @@ mod control;
 mod control_api;
 mod hot_reload;
 mod notifications;
+pub mod windows_service;
 
 pub use control::{
     check_daemon_status, remove_pid_file, send_reload_signal, send_stop_signal, write_pid_file,
@@ -231,7 +232,7 @@ impl DaemonState {
     }
 
     fn send_notification(&self, message: &str) -> Result<()> {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         {
             use notify_rust::Notification;
             Notification::new()
@@ -241,6 +242,8 @@ impl DaemonState {
                 .show()
                 .map_err(|e| AppError::Message(format!("Notification error: {}", e)))?;
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = message;
         Ok(())
     }
 }

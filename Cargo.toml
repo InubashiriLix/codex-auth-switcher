@@ -46,4 +46,5 @@ signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 sd-notify = "0.4"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows-service = "0.8"

@@ -37,7 +37,7 @@ Die automatische Erkennung prüft `LC_ALL`, `LC_MESSAGES` und `LANG`; unbekannte
 
 `m` wechselt den Bereich, `j/k` bewegt die Auswahl, `Space/x` verwaltet Pool und sicheren Wechsel, `r/R` prüft Konten, `t` wechselt das Theme, `?` öffnet Hilfe und `q` beendet.
 
-Die Konfiguration liegt in `$XDG_CONFIG_HOME/codex-switcher/config.toml`, Konten und Laufzeitdaten unter `$XDG_DATA_HOME/codex-switcher/`. Linux ist derzeit die verifizierte Plattform.
+Unter Linux liegt die Konfiguration in `$XDG_CONFIG_HOME/codex-switcher/config.toml`, die Daten unter `$XDG_DATA_HOME/codex-switcher/`. Windows 10/11 x86_64 verwendet `%APPDATA%\CodexSwitcher` und `%LOCALAPPDATA%\CodexSwitcher`; verfügbar sind ein unsigniertes MSI und ein LocalService.
 
 ## Sicherheit und Beiträge
 

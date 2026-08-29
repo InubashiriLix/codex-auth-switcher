@@ -62,7 +62,7 @@ language = "auto"
 | `t` | 切换主题 |
 | `?` / `q` | 帮助 / 退出 |
 
-配置位于 `$XDG_CONFIG_HOME/codex-switcher/config.toml`，账户和运行数据位于 `$XDG_DATA_HOME/codex-switcher/`。项目目前正式验证 Linux；macOS 和 Windows 仍需要真实环境测试。
+Linux 配置位于 `$XDG_CONFIG_HOME/codex-switcher/config.toml`，账户和运行数据位于 `$XDG_DATA_HOME/codex-switcher/`。Windows 10/11 x86_64 使用 `%APPDATA%\CodexSwitcher` 与 `%LOCALAPPDATA%\CodexSwitcher`；可使用未签名 MSI 和 LocalService 服务。
 
 ## 安全边界与贡献
 

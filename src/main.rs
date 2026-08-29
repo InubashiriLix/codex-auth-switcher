@@ -3,7 +3,7 @@ use clap::Parser;
 use codex_switcher::{
     Paths,
     account::load_index,
-    cli::{Cli, Commands},
+    cli::{Cli, Commands, ServiceSubcommand},
     config::{Config, load_config},
     daemon::{
         check_daemon_status, control_request, run_daemon, send_reload_signal, send_stop_signal,
@@ -23,6 +23,9 @@ fn main() -> Result<()> {
 
     // 处理守护进程控制命令（同步）
     if let Some(command) = &cli.command {
+        if let Commands::Service(service) = command {
+            return handle_service_command(&service.command);
+        }
         return handle_daemon_command_sync(command, &p, bootstrap_language);
     }
 
@@ -225,7 +228,29 @@ fn handle_daemon_command_sync(command: &Commands, paths: &Paths, language: Langu
             println!("{}", translate(language, "cli-reload-sent", None));
             Ok(())
         }
+        Commands::Service(_) => unreachable!("service commands are handled before daemon commands"),
     }
+}
+
+fn handle_service_command(command: &ServiceSubcommand) -> Result<()> {
+    use codex_switcher::daemon::windows_service::{ServiceCommand, handle};
+    let command = match command {
+        ServiceSubcommand::Install {
+            service_root,
+            codex_home,
+        } => ServiceCommand::Install {
+            service_root: service_root.clone(),
+            codex_home: codex_home.clone(),
+        },
+        ServiceSubcommand::Start => ServiceCommand::Start,
+        ServiceSubcommand::Stop => ServiceCommand::Stop,
+        ServiceSubcommand::Status => ServiceCommand::Status,
+        ServiceSubcommand::Uninstall => ServiceCommand::Uninstall,
+        ServiceSubcommand::Run { service_root } => ServiceCommand::Run {
+            service_root: service_root.clone(),
+        },
+    };
+    handle(command)
 }
 
 fn bootstrap_language(paths: &Paths) -> Language {

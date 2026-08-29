@@ -37,7 +37,7 @@ language = "auto" # auto, zh-cn, en, ja, es, de, it, fr
 
 `m` はワークスペース選択、`j/k` は移動、`Space/x` はプール登録と安全な切替、`r/R` は確認、`t` はテーマ、`?` はヘルプ、`q` は終了です。
 
-設定は `$XDG_CONFIG_HOME/codex-switcher/config.toml`、アカウントと実行データは `$XDG_DATA_HOME/codex-switcher/` に保存されます。現在正式に検証済みのプラットフォームは Linux です。
+Linux の設定は `$XDG_CONFIG_HOME/codex-switcher/config.toml`、アカウントと実行データは `$XDG_DATA_HOME/codex-switcher/` に保存されます。Windows 10/11 x86_64 では `%APPDATA%\CodexSwitcher` と `%LOCALAPPDATA%\CodexSwitcher` を使用し、未署名 MSI と LocalService を提供します。
 
 ## セキュリティと貢献
 

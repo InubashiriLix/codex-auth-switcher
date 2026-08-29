@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Codex Switcher"
+           Manufacturer="Codex Switcher"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="9C1F1E0D-44EA-4E31-9B81-A29D6DD833BB"
+           Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Codex Switcher is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Codex Switcher">
+        <Component Id="CodexSwitcherExecutable" Bitness="always64">
+          <File Id="CodexSwitcherExe" Source="$(var.BinaryPath)" KeyPath="yes" />
+          <ServiceInstall Id="CodexSwitcherService"
+                          Name="CodexSwitcher"
+                          DisplayName="Codex Switcher"
+                          Description="Local Codex authentication proxy daemon"
+                          Type="ownProcess"
+                          Start="demand"
+                          ErrorControl="normal"
+                          Account="NT AUTHORITY\LocalService"
+                          Arguments="service run --service-root [CommonAppDataFolder]CodexSwitcher" />
+          <ServiceControl Id="CodexSwitcherServiceControl"
+                          Name="CodexSwitcher"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="CodexSwitcherServiceRoot" Name="CodexSwitcher">
+        <Component Id="CodexSwitcherServiceRootComponent" Bitness="always64">
+          <CreateFolder />
+          <RegistryValue Root="HKLM" Key="Software\CodexSwitcher" Name="ServiceRoot" Value="[CommonAppDataFolder]CodexSwitcher" Type="string" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Codex Switcher" Level="1">
+      <ComponentRef Id="CodexSwitcherExecutable" />
+      <ComponentRef Id="CodexSwitcherServiceRootComponent" />
+    </Feature>
+  </Package>
+</Wix>
