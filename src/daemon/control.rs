@@ -52,7 +52,31 @@ pub fn check_daemon_status(paths: &Paths) -> Result<DaemonStatus> {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{
+                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            let _ = remove_pid_file(paths);
+            return Ok(DaemonStatus::Stale);
+        }
+        let mut exit_code = 0;
+        let active = unsafe { GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == 259 };
+        unsafe { CloseHandle(handle) };
+        if active {
+            Ok(DaemonStatus::Running(pid))
+        } else {
+            let _ = remove_pid_file(paths);
+            Ok(DaemonStatus::Stale)
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         Ok(DaemonStatus::Unknown(pid))
     }

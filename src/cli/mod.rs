@@ -1,5 +1,6 @@
 use crate::i18n::{Language, translate};
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "codex-switcher")]
@@ -29,6 +30,39 @@ pub enum Commands {
     DaemonStop,
     /// Reload daemon configuration (hot reload)
     DaemonReload,
+    /// Manage the native Windows Service
+    Service(ServiceArgs),
+}
+
+#[derive(Args)]
+pub struct ServiceArgs {
+    #[command(subcommand)]
+    pub command: ServiceSubcommand,
+}
+
+#[derive(Subcommand)]
+pub enum ServiceSubcommand {
+    /// Install and start the LocalService daemon (Windows only)
+    Install {
+        #[arg(long)]
+        service_root: PathBuf,
+        #[arg(long)]
+        codex_home: PathBuf,
+    },
+    /// Start the installed Windows Service
+    Start,
+    /// Stop the installed Windows Service
+    Stop,
+    /// Show Windows Service status
+    Status,
+    /// Remove the Windows Service registration
+    Uninstall,
+    /// Internal SCM entrypoint
+    #[command(hide = true)]
+    Run {
+        #[arg(long)]
+        service_root: PathBuf,
+    },
 }
 
 impl Cli {
@@ -77,6 +111,43 @@ impl Cli {
                 *subcommand = subcommand.clone().about(translate(language, key, None));
             }
         }
+        if let Some(service) = command.find_subcommand_mut("service") {
+            let help = || {
+                clap::Arg::new("service-help")
+                    .short('h')
+                    .long("help")
+                    .help(translate(language, "cli-print-help", None))
+                    .action(clap::ArgAction::Help)
+            };
+            *service = service
+                .clone()
+                .about(translate(language, "cli-service", None))
+                .arg(help());
+            for (name, key) in [
+                ("install", "cli-service-install"),
+                ("start", "cli-service-start"),
+                ("stop", "cli-service-stop"),
+                ("status", "cli-service-status"),
+                ("uninstall", "cli-service-uninstall"),
+            ] {
+                if let Some(action) = service.find_subcommand_mut(name) {
+                    let mut localized = action
+                        .clone()
+                        .about(translate(language, key, None))
+                        .arg(help());
+                    if name == "install" {
+                        localized = localized
+                            .mut_arg("service_root", |arg| {
+                                arg.help(translate(language, "cli-service-root", None))
+                            })
+                            .mut_arg("codex_home", |arg| {
+                                arg.help(translate(language, "cli-codex-home", None))
+                            });
+                    }
+                    *action = localized;
+                }
+            }
+        }
         command
     }
 
@@ -97,5 +168,22 @@ mod tests {
             .to_string();
         assert!(help.contains("Gestor de autenticación"), "{help}");
         assert!(help.contains("Activar el modo proxy"), "{help}");
+    }
+
+    #[test]
+    fn service_install_requires_explicit_roots() {
+        assert!(Cli::try_parse_from(["codex-switcher", "service", "install"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "codex-switcher",
+                "service",
+                "install",
+                "--service-root",
+                "/service-root",
+                "--codex-home",
+                "/codex-home",
+            ])
+            .is_ok()
+        );
     }
 }

@@ -1,4 +1,9 @@
-use crate::{error::*, i18n::LanguagePreference, paths::Paths, types::Theme};
+use crate::{
+    error::*,
+    i18n::LanguagePreference,
+    paths::{Paths, user_home_dir},
+    types::Theme,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -36,12 +41,8 @@ pub struct Config {
 
 impl Config {
     pub fn defaults() -> Self {
-        let home = env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let data = env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/share"));
+        let home = user_home_dir();
+        let data = data_home_dir(&home);
         Self {
             codex_home: env::var_os("CODEX_HOME")
                 .map(PathBuf::from)
@@ -55,6 +56,21 @@ impl Config {
             onboarding_acknowledged: false,
             startup_notice: None,
         }
+    }
+}
+
+fn data_home_dir(home: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData/Local"))
+    }
+    #[cfg(not(windows))]
+    {
+        env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"))
     }
 }
 
@@ -220,9 +236,12 @@ fn repair_invalid_codex_home(
     mut config: Config,
     reason: &str,
 ) -> Result<Config> {
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| AppError::Message(format!("{reason}；HOME 未设置，无法自动恢复")))?;
+    let home = user_home_dir();
+    if home == Path::new(".") {
+        return Err(AppError::Message(format!(
+            "{reason}；未设置用户主目录，无法自动恢复"
+        )));
+    }
     let fallback = home.join(".codex");
     validate_codex_home(&fallback).map_err(|error| {
         AppError::Message(format!("{reason}；默认 Codex 目录也不可用：{error}"))
@@ -316,14 +335,16 @@ mod tests {
     fn invalid_overlong_home_is_backed_up_and_repaired() {
         let paths = test_paths();
         fs::create_dir_all(&paths.config_dir).unwrap();
-        let invalid = format!("'{}{}'", "/tmp/", "x".repeat(1_987));
+        let invalid_path = paths.config_dir.join("x".repeat(1_987));
+        let invalid = format!("'{:?}'", invalid_path.display().to_string());
+        let accounts_dir = paths.config_dir.join("accounts");
         let raw = format!(
-            "# retained comment\ncodex_home = {invalid:?}\naccounts_dir = \"/tmp/accounts\"\nunknown_key = \"keep-me\"\n"
+            "# retained comment\ncodex_home = {invalid}\naccounts_dir = {accounts_dir:?}\nunknown_key = \"keep-me\"\n"
         );
         fs::write(&paths.config_file, &raw).unwrap();
 
         let loaded = load_config(&paths).unwrap();
-        let expected = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".codex");
+        let expected = user_home_dir().join(".codex");
         assert_eq!(loaded.codex_home, expected);
         assert!(
             loaded.startup_notice.as_deref().is_some_and(|notice| {
@@ -361,10 +382,9 @@ mod tests {
     #[test]
     fn codex_home_validation_rejects_ambiguous_and_impossible_paths() {
         assert!(validate_codex_home(Path::new("relative/.codex")).is_err());
-        assert!(validate_codex_home(&PathBuf::from("/").join("x".repeat(256))).is_err());
-        assert!(validate_codex_home(&PathBuf::from("/").join("x".repeat(4096))).is_err());
-
         let root = std::env::temp_dir().join(format!("codex-switcher-home-{}", Uuid::new_v4()));
+        assert!(validate_codex_home(&root.join("x".repeat(256))).is_err());
+        assert!(validate_codex_home(&root.join("x".repeat(4096))).is_err());
         fs::create_dir_all(&root).unwrap();
         assert!(validate_codex_home(&root).is_ok());
         assert!(validate_codex_home(&root.join("not-created-yet")).is_ok());
@@ -385,8 +405,13 @@ mod tests {
 
     #[test]
     fn language_preference_is_backward_compatible_and_persistent() {
-        let mut old: Config =
-            toml::from_str("codex_home = '/tmp/codex'\naccounts_dir = '/tmp/accounts'\n").unwrap();
+        let root = std::env::temp_dir().join(format!("codex-switcher-language-{}", Uuid::new_v4()));
+        let mut old: Config = toml::from_str(&format!(
+            "codex_home = {:?}\naccounts_dir = {:?}\n",
+            root.join("codex").display().to_string(),
+            root.join("accounts").display().to_string(),
+        ))
+        .unwrap();
         assert_eq!(old.language, LanguagePreference::Auto);
 
         let paths = test_paths();

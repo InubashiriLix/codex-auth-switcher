@@ -9,8 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS and Windows support is not ready yet; keep CI Linux-only.
-        os: [ubuntu-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -19,9 +18,19 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Format
-        if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test --all-targets
+      - name: Build Windows MSI
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release
+          dotnet tool install --global wix --version 5.0.2
+          wix build installer/windows/CodexSwitcher.wxs `
+            -arch x64 `
+            -d BinaryPath='${{ github.workspace }}\target\release\codex-switcher.exe' `
+            -d ProductVersion=0.2.1 `
+            -o target\CodexSwitcher-x86_64.msi

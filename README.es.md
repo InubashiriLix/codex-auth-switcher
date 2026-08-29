@@ -37,7 +37,7 @@ La detección automática consulta `LC_ALL`, `LC_MESSAGES` y `LANG`; los idiomas
 
 `m` cambia de espacio, `j/k` mueve la selección, `Space/x` gestiona el grupo y el cambio seguro, `r/R` comprueba cuentas, `t` cambia el tema, `?` abre la ayuda y `q` sale.
 
-La configuración reside en `$XDG_CONFIG_HOME/codex-switcher/config.toml`; las cuentas y los metadatos están en `$XDG_DATA_HOME/codex-switcher/`. Linux es la plataforma verificada actualmente.
+En Linux, la configuración reside en `$XDG_CONFIG_HOME/codex-switcher/config.toml` y los datos en `$XDG_DATA_HOME/codex-switcher/`. En Windows 10/11 x86_64 se usan `%APPDATA%\CodexSwitcher` y `%LOCALAPPDATA%\CodexSwitcher`, con MSI sin firma y servicio LocalService.
 
 ## Seguridad y contribuciones
 
