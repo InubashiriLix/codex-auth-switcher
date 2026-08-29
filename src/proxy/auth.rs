@@ -177,7 +177,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     if path.exists() && fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Err(AppError::Message("拒绝写入符号链接认证快照".into()));
     }
-    let temp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let temp = path.with_file_name(format!(".tmp-{}", Uuid::new_v4()));
     fs::write(&temp, bytes)?;
     #[cfg(unix)]
     {

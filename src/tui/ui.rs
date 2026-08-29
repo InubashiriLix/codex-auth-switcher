@@ -152,13 +152,17 @@ pub struct Ui {
 
 impl Ui {
     pub fn new(
-        config: Config,
+        mut config: Config,
         index: AccountIndex,
         proxy_state: Option<ProxyState>,
         workspace: Workspace,
     ) -> Self {
         let attached_daemon = crate::daemon::read_runtime(&crate::paths::paths()).is_ok();
         let (action_sender, action_updates) = std::sync::mpsc::channel();
+        let initial_notice = config
+            .startup_notice
+            .take()
+            .unwrap_or_else(|| "就绪".into());
         let mut ui = Self {
             config,
             index,
@@ -172,7 +176,7 @@ impl Ui {
             modal: Modal::None,
             detail: None,
             input: String::new(),
-            notice: "就绪".into(),
+            notice: initial_notice,
             tick: 0,
             proxy_state,
             checking: None,

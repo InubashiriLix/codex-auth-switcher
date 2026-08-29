@@ -200,6 +200,9 @@ pub fn import_current(config: &Config, index: &mut AccountIndex) -> Result<()> {
 }
 
 pub fn activate(config: &Config, account: &Account) -> Result<()> {
+    // Validate before process inspection or any filesystem call. In
+    // particular, never pass a corrupted overlong config value to mkdir.
+    crate::config::validate_codex_home(&config.codex_home)?;
     if current_codex_running() {
         return Err(AppError::Message(
             "仍有 Codex 在运行；请退出后再切换认证。".into(),
@@ -403,7 +406,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         ensure_private_dir(parent)?;
     }
     reject_symlink(path)?;
-    let temp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let temp = path.with_file_name(format!(".tmp-{}", Uuid::new_v4()));
     fs::write(&temp, bytes)?;
     #[cfg(unix)]
     {
@@ -412,4 +415,31 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     crate::filesystem::atomic_replace(&temp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activation_rejects_invalid_home_before_filesystem_access() {
+        let mut config = Config::defaults();
+        config.codex_home = Path::new("not-an-absolute-codex-home").to_path_buf();
+        let account = Account {
+            id: Uuid::new_v4(),
+            label: "test".into(),
+            source: "test".into(),
+            imported_at: Utc::now(),
+            email: None,
+            plan: None,
+            account_id: None,
+            status: CheckStatus::default(),
+            tenant_id: "local".into(),
+            proxy_enabled: false,
+        };
+
+        let error = activate(&config, &account).unwrap_err().to_string();
+        assert!(error.contains("Codex 目录配置无效"));
+        assert!(!error.contains("os error 36"));
+    }
 }

@@ -248,6 +248,7 @@ pub fn run_daemon(
 }
 
 async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> Result<()> {
+    let recovery_notice = config.startup_notice.clone();
     // 初始化守护进程状态
     let mut state = DaemonState::new(config.clone(), index, paths.clone())?;
 
@@ -261,6 +262,18 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
         account_id: None,
         detail: "代理守护进程已启动".into(),
     });
+    if let Some(notice) = recovery_notice {
+        let _ = state.metadata_store.record_event(&RuntimeEvent {
+            id: Uuid::new_v4().to_string(),
+            occurred_at: Utc::now(),
+            tenant_id: "local".into(),
+            device_id: std::env::var("HOSTNAME").unwrap_or_else(|_| "local-device".into()),
+            client_instance_id: None,
+            kind: "config_recovered".into(),
+            account_id: None,
+            detail: crate::storage::sanitize(&notice),
+        });
+    }
 
     // 写入PID文件
     write_pid_file(&paths)?;

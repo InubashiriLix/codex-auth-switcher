@@ -356,7 +356,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         ensure_private_dir(parent)?;
     }
     reject_symlink(path)?;
-    let temp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let temp = path.with_file_name(format!(".tmp-{}", Uuid::new_v4()));
     fs::write(&temp, bytes)?;
     #[cfg(unix)]
     {

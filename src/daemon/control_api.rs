@@ -879,7 +879,7 @@ pub async fn control_stream(paths: &Paths) -> Result<reqwest::Response> {
 }
 
 fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let temp = path.with_file_name(format!(".tmp-{}", Uuid::new_v4()));
     fs::write(&temp, bytes)?;
     #[cfg(unix)]
     {

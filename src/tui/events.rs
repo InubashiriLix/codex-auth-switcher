@@ -711,8 +711,15 @@ fn finish_text_modal(paths: &Paths, ui: &mut Ui) {
             if path.as_os_str().is_empty() {
                 Err(AppError::Message("路径不能为空".into()))
             } else {
-                ui.config.codex_home = path;
-                save_current_config(paths, &ui.config)
+                let mut candidate = ui.config.clone();
+                candidate.codex_home = path;
+                match save_current_config(paths, &candidate) {
+                    Ok(notice) => {
+                        ui.config = candidate;
+                        Ok(notice)
+                    }
+                    Err(error) => Err(error),
+                }
             }
         }
         _ => Ok(String::new()),
@@ -783,6 +790,40 @@ mod tests {
 
     fn key(character: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
+    }
+
+    fn test_paths() -> Paths {
+        let root = std::env::temp_dir().join(format!(
+            "codex-switcher-settings-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        Paths {
+            config_file: root.join("config.toml"),
+            index_file: root.join("accounts.toml"),
+            config_dir: root.clone(),
+            pid_file: root.join("daemon.pid"),
+            runtime_file: root.join("runtime.json"),
+            database_file: root.join("runtime.sqlite3"),
+        }
+    }
+
+    #[test]
+    fn invalid_settings_path_does_not_poison_live_or_saved_config() {
+        let paths = test_paths();
+        let mut ui = ui();
+        let original = std::env::temp_dir().join(format!(
+            "codex-switcher-valid-home-{}",
+            uuid::Uuid::new_v4()
+        ));
+        ui.config.codex_home.clone_from(&original);
+        ui.modal = Modal::Settings;
+        ui.input = "'relative-and-shell-quoted/.codex'".into();
+
+        finish_text_modal(&paths, &mut ui);
+
+        assert_eq!(ui.config.codex_home, original);
+        assert!(ui.notice.contains("绝对路径"));
+        assert!(!paths.config_file.exists());
     }
 
     #[test]
