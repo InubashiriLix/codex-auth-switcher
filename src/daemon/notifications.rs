@@ -1,12 +1,23 @@
-use crate::types::Account;
+use crate::{
+    i18n::{Language, LanguagePreference, translate, translate_with},
+    types::Account,
+};
 
 pub struct NotificationManager {
     enabled: bool,
+    language: Language,
 }
 
 impl NotificationManager {
     pub fn new(enabled: bool) -> Self {
-        Self { enabled }
+        Self {
+            enabled,
+            language: LanguagePreference::Auto.resolve(),
+        }
+    }
+
+    pub fn with_language(enabled: bool, language: Language) -> Self {
+        Self { enabled, language }
     }
 
     pub fn notify_switch_recommended(&self, account: &Account) {
@@ -14,7 +25,11 @@ impl NotificationManager {
             return;
         }
 
-        let message = format!("推荐切换到账户: {}", account.label);
+        let message = translate_with(
+            self.language,
+            "notification-recommended",
+            [("account", account.label.as_str())],
+        );
         self.send_notification("Codex Switcher", &message);
     }
 
@@ -23,7 +38,11 @@ impl NotificationManager {
             return;
         }
 
-        let message = format!("已切换账户: {} → {}", from.label, to.label);
+        let message = translate_with(
+            self.language,
+            "notification-switched",
+            [("from", from.label.as_str()), ("to", to.label.as_str())],
+        );
         self.send_notification("Codex Switcher", &message);
     }
 
@@ -32,8 +51,14 @@ impl NotificationManager {
             return;
         }
 
-        let message = format!("切换失败: {}", reason);
-        self.send_notification("Codex Switcher - 错误", &message);
+        let message = translate_with(self.language, "notification-failed", [("reason", reason)]);
+        self.send_notification(
+            &format!(
+                "Codex Switcher - {}",
+                translate(self.language, "error", None)
+            ),
+            &message,
+        );
     }
 
     pub fn notify_threshold_reached(&self, account: &Account, percent: f64) {
@@ -41,8 +66,22 @@ impl NotificationManager {
             return;
         }
 
-        let message = format!("账户 {} 使用率达到 {:.1}%", account.label, percent);
-        self.send_notification("Codex Switcher - 警告", &message);
+        let percent_text = format!("{percent:.1}");
+        let message = translate_with(
+            self.language,
+            "notification-threshold",
+            [
+                ("account", account.label.as_str()),
+                ("percent", percent_text.as_str()),
+            ],
+        );
+        self.send_notification(
+            &format!(
+                "Codex Switcher - {}",
+                translate(self.language, "warning", None)
+            ),
+            &message,
+        );
     }
 
     #[cfg(target_os = "linux")]

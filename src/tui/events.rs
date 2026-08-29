@@ -3,6 +3,7 @@ use super::{
 };
 use crate::{
     error::{AppError, Result},
+    i18n::{LanguagePreference, translate_with},
     paths::Paths,
     proxy::RuntimeState,
 };
@@ -59,6 +60,10 @@ pub fn handle_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
     if ui.modal != Modal::None {
         return handle_modal(key, paths, ui);
     }
+    if key.code == KeyCode::Char('l') {
+        ui.open_language_selector();
+        return Ok(false);
+    }
     if ui.detail.is_some() {
         return handle_detail_key(key, paths, ui);
     }
@@ -89,7 +94,7 @@ pub fn handle_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
             KeyCode::Char('r' | 'R' | 'a' | 'i' | 'n' | 'd') | KeyCode::Enter
         )
     {
-        ui.notice = "检测进行中；完成后再修改账户".into();
+        ui.notice = ui.tr("notice-check-in-progress");
         return Ok(false);
     }
 
@@ -160,7 +165,7 @@ fn request_exit(ui: &mut Ui) -> Result<bool> {
         .unwrap_or(0);
     if ui.owned_daemon.is_some() && active > 0 {
         ui.open_confirmation(Modal::ConfirmExit);
-        ui.notice = format!("仍有 {active} 个活动请求");
+        ui.notice = translate_with(ui.language(), "notice-active-requests", [("count", active)]);
         Ok(false)
     } else {
         Ok(true)
@@ -180,7 +185,7 @@ fn handle_account_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool>
         KeyCode::Char('G') => ui.selected = visible.len().saturating_sub(1),
         KeyCode::Esc => {
             ui.filter.clear();
-            ui.notice = "已清除过滤".into();
+            ui.notice = ui.tr("notice-filter-cleared");
         }
         KeyCode::Char('/') => {
             ui.open_text_editor(Modal::Filter, ui.filter.clone());
@@ -217,12 +222,16 @@ fn handle_account_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool>
         KeyCode::Char('r') => {
             if let Some(index) = ui.selected_id() {
                 let account = ui.index.accounts[index].clone();
-                ui.notice = format!("正在检测 {}…", account.label);
+                ui.notice = translate_with(
+                    ui.language(),
+                    "notice-checking-account",
+                    [("account", account.label.as_str())],
+                );
                 start_probe(ui, vec![account]);
             }
         }
         KeyCode::Char('R') => {
-            ui.notice = "正在检测全部账户…".into();
+            ui.notice = ui.tr("notice-checking-all");
             start_probe(ui, ui.index.accounts.clone());
         }
         KeyCode::Enter => {
@@ -252,12 +261,12 @@ fn handle_proxy_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
         KeyCode::Char('r') if ui.proxy_panel == ProxyPanel::Pool => {
             if let Some(index) = ui.pool_selected_id() {
                 start_probe(ui, vec![ui.index.accounts[index].clone()]);
-                ui.notice = "正在检测所选账户…".into();
+                ui.notice = ui.tr("notice-checking-selected");
             }
         }
         KeyCode::Char('R') if ui.proxy_panel == ProxyPanel::Pool => {
             start_probe(ui, ui.index.accounts.clone());
-            ui.notice = "正在检测全部账户…".into();
+            ui.notice = ui.tr("notice-checking-all");
         }
         KeyCode::Char('x') if ui.proxy_panel == ProxyPanel::Pool => switch_route(paths, ui),
         KeyCode::Char('s') => {
@@ -287,7 +296,7 @@ fn handle_proxy_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
                 set_auto_switch(paths, ui, false);
             }
         }
-        KeyCode::Esc => ui.notice = "使用 m 切换工作区".into(),
+        KeyCode::Esc => ui.notice = ui.tr("notice-use-workspace-key"),
         _ => {}
     }
     Ok(false)
@@ -321,7 +330,7 @@ fn open_proxy_detail(ui: &mut Ui) {
         && ui.recent_requests.is_empty()
         && ui.recent_events.is_empty()
     {
-        ui.notice = "暂无可查看的近期事件".into();
+        ui.notice = ui.tr("notice-no-events");
         return;
     }
     ui.detail = match ui.proxy_panel {
@@ -354,17 +363,17 @@ fn toggle_pool(paths: &Paths, ui: &mut Ui) {
             &endpoint,
             Some(json!({"enabled":enabled})),
             if enabled {
-                "账户已加入代理池"
+                ui.tr("notice-pool-added")
             } else {
-                "账户已移出代理池"
+                ui.tr("notice-pool-removed")
             },
         );
         ui.index.accounts[index].proxy_enabled = enabled;
     } else {
         ui.index.accounts[index].proxy_enabled = enabled;
         ui.notice = match crate::account::save_index(paths, &ui.index) {
-            Ok(()) if enabled => "账户已加入代理池".into(),
-            Ok(()) => "账户已移出代理池".into(),
+            Ok(()) if enabled => ui.tr("notice-pool-added"),
+            Ok(()) => ui.tr("notice-pool-removed"),
             Err(error) => error.to_string(),
         };
     }
@@ -376,12 +385,16 @@ fn switch_route(paths: &Paths, ui: &mut Ui) {
     };
     let account = &ui.index.accounts[index];
     if !account.proxy_enabled {
-        ui.notice = "请先按 Space 将账户加入代理池".into();
+        ui.notice = ui.tr("notice-pool-first");
         return;
     }
     let endpoint = format!("/v1/accounts/{}/switch", account.id);
-    let message = format!("将在下一安全请求边界切换到 {}", account.label);
-    enqueue_control(paths, ui, Method::POST, &endpoint, None, &message);
+    let message = translate_with(
+        ui.language(),
+        "notice-route-next",
+        [("account", account.label.as_str())],
+    );
+    enqueue_control(paths, ui, Method::POST, &endpoint, None, message);
 }
 
 fn toggle_pause(paths: &Paths, ui: &mut Ui) {
@@ -389,14 +402,14 @@ fn toggle_pause(paths: &Paths, ui: &mut Ui) {
         RuntimeState::Running => "/v1/proxy/pause",
         RuntimeState::Paused => "/v1/proxy/resume",
         _ => {
-            ui.notice = "代理未运行，无法暂停或恢复".into();
+            ui.notice = ui.tr("notice-proxy-not-running");
             return;
         }
     };
     let message = if endpoint.ends_with("pause") {
-        "路由已暂停"
+        ui.tr("notice-routing-paused")
     } else {
-        "路由已恢复"
+        ui.tr("notice-routing-resumed")
     };
     enqueue_control(paths, ui, Method::POST, endpoint, None, message);
 }
@@ -410,12 +423,12 @@ fn start_proxy(paths: &Paths, ui: &mut Ui) {
                 let _ = handle.join();
             }
         } else {
-            ui.notice = "内嵌代理正在启动，请稍候".into();
+            ui.notice = ui.tr("notice-embedded-starting-wait");
             return;
         }
     }
     if ui.eligible_accounts() == 0 {
-        ui.notice = "无法启动：请先检测账户并按 Space 加入代理池".into();
+        ui.notice = ui.tr("notice-proxy-needs-pool");
         return;
     }
     if ui.attached_daemon {
@@ -425,7 +438,7 @@ fn start_proxy(paths: &Paths, ui: &mut Ui) {
             Method::POST,
             "/v1/proxy/start",
             None,
-            "数据代理正在启动…",
+            ui.tr("notice-proxy-starting"),
         );
         return;
     }
@@ -445,7 +458,7 @@ fn start_proxy(paths: &Paths, ui: &mut Ui) {
             daemon_paths,
         ))
     }));
-    ui.notice = "正在启动内嵌代理…".into();
+    ui.notice = ui.tr("notice-embedded-starting");
 }
 
 fn stop_proxy(paths: &Paths, ui: &mut Ui) {
@@ -455,7 +468,7 @@ fn stop_proxy(paths: &Paths, ui: &mut Ui) {
         Method::POST,
         "/v1/proxy/stop",
         None,
-        "代理与 Codex 接入均已关闭；请重启 Codex",
+        ui.tr("notice-proxy-integration-off"),
     );
 }
 
@@ -465,7 +478,11 @@ fn acknowledge_onboarding(paths: &Paths, ui: &mut Ui) {
     }
     ui.config.onboarding_acknowledged = true;
     if let Err(error) = crate::config::save_config(paths, &ui.config) {
-        ui.notice = format!("首次设置状态保存失败：{error}");
+        ui.notice = translate_with(
+            ui.language(),
+            "notice-onboarding-save-failed",
+            [("error", error.to_string())],
+        );
     }
     if ui.attached_daemon {
         enqueue_control(
@@ -474,7 +491,7 @@ fn acknowledge_onboarding(paths: &Paths, ui: &mut Ui) {
             Method::PATCH,
             "/v1/config",
             Some(json!({"onboarding_acknowledged":true})),
-            "首次设置提示已记住",
+            ui.tr("notice-onboarding-saved"),
         );
     }
 }
@@ -490,15 +507,15 @@ fn set_auto_switch(paths: &Paths, ui: &mut Ui, enabled: bool) {
             "/v1/config",
             Some(json!({"auto_switch":enabled})),
             if enabled {
-                "已明确启用自动切换"
+                ui.tr("notice-auto-switch-on")
             } else {
-                "已关闭自动切换"
+                ui.tr("notice-auto-switch-off")
             },
         );
     }
     ui.notice = match local {
-        Ok(()) if enabled => "已明确启用自动切换".into(),
-        Ok(()) => "已关闭自动切换".into(),
+        Ok(()) if enabled => ui.tr("notice-auto-switch-on"),
+        Ok(()) => ui.tr("notice-auto-switch-off"),
         Err(error) => error.to_string(),
     };
 }
@@ -537,11 +554,11 @@ fn update_proxy_config(paths: &Paths, ui: &mut Ui, patch: serde_json::Value) {
             Method::PATCH,
             "/v1/config",
             Some(patch),
-            "代理设置已更新",
+            ui.tr("notice-proxy-settings-updated"),
         );
     }
     ui.notice = local
-        .map(|_| "代理设置已更新".into())
+        .map(|_| ui.tr("notice-proxy-settings-updated"))
         .unwrap_or_else(|error| error.to_string());
 }
 
@@ -558,9 +575,9 @@ fn set_integration(paths: &Paths, ui: &mut Ui, enabled: bool) {
             },
             None,
             if enabled {
-                "已启用 Codex 接入；请重启 Codex"
+                ui.tr("notice-integration-on")
             } else {
-                "已停用 Codex 接入；请重启 Codex"
+                ui.tr("notice-integration-off")
             },
         );
         return;
@@ -576,11 +593,10 @@ fn set_integration(paths: &Paths, ui: &mut Ui, enabled: bool) {
     ui.notice = result
         .map(|_| {
             if enabled {
-                "已启用 Codex 接入；请重启 Codex"
+                ui.tr("notice-integration-on")
             } else {
-                "已停用 Codex 接入；请重启 Codex"
+                ui.tr("notice-integration-off")
             }
-            .into()
         })
         .unwrap_or_else(|error| error.to_string());
 }
@@ -618,11 +634,11 @@ fn handle_modal(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
                 acknowledge_onboarding(paths, ui);
                 if ui.index.accounts.is_empty() {
                     ui.switch_workspace(Workspace::Accounts);
-                    ui.notice = "按 a 导入当前 Codex 登录，或按 i 导入 JSON/路径".into();
+                    ui.notice = ui.tr("notice-onboarding-import");
                 } else {
                     ui.modal = Modal::None;
                     ui.proxy_panel = ProxyPanel::Pool;
-                    ui.notice = "j/k 选择账户，r 检测，Space 加入代理池".into();
+                    ui.notice = ui.tr("notice-onboarding-pool");
                 }
             }
             KeyCode::Char('2') => {
@@ -641,9 +657,57 @@ fn handle_modal(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
             }
             _ => {}
         },
+        Modal::LanguageSelector => handle_language_selector_key(key, paths, ui),
         _ => {}
     }
     Ok(false)
+}
+
+fn handle_language_selector_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) {
+    let count = LanguagePreference::ALL.len();
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => {
+            ui.language_selected = (ui.language_selected + 1).min(count - 1);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            ui.language_selected = ui.language_selected.saturating_sub(1);
+        }
+        KeyCode::Home => ui.language_selected = 0,
+        KeyCode::End => ui.language_selected = count - 1,
+        KeyCode::Char(value @ '1'..='8') => {
+            ui.language_selected = (value as usize - '1' as usize).min(count - 1);
+        }
+        KeyCode::Enter => {
+            let preference = LanguagePreference::ALL[ui.language_selected];
+            let mut candidate = ui.config.clone();
+            candidate.language = preference;
+            match save_current_config(paths, &candidate) {
+                Ok(_) => {
+                    ui.config = candidate;
+                    ui.modal = Modal::None;
+                    let language = ui.language().native_name();
+                    ui.notice =
+                        translate_with(ui.language(), "language-saved", [("language", language)]);
+                    if ui.attached_daemon || ui.owned_daemon.is_some() {
+                        let _ = call_control(
+                            paths,
+                            Method::PATCH,
+                            "/v1/config",
+                            Some(json!({"language": preference.config_value()})),
+                        );
+                    }
+                }
+                Err(error) => {
+                    ui.notice = translate_with(
+                        ui.language(),
+                        "language-save-failed",
+                        [("error", error.to_string())],
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn handle_help_key(key: KeyEvent, ui: &mut Ui) {
@@ -715,7 +779,7 @@ fn execute_confirmation(paths: &Paths, ui: &mut Ui, confirmed: bool) -> Result<b
             if let Some(index) = ui.selected_id()
                 && let Some(email) = ui.index.accounts[index].email.clone()
             {
-                ui.notice = rename_account(&mut ui.index, paths, index, email)
+                ui.notice = rename_account(&ui.config, &mut ui.index, paths, index, email)
                     .unwrap_or_else(|error| error.to_string());
             }
         }
@@ -789,24 +853,34 @@ fn submit_text_editor(paths: &Paths, ui: &mut Ui) {
             ui.filter.clone_from(&value);
             ui.selected = 0;
             Ok(if ui.filter.is_empty() {
-                "已清除过滤".into()
+                ui.tr("notice-filter-cleared")
             } else {
-                format!("正在过滤：{}", ui.filter)
+                translate_with(
+                    ui.language(),
+                    "notice-filtering",
+                    [("filter", ui.filter.as_str())],
+                )
             })
         }
         Modal::Rename if value.trim().is_empty() => {
-            Err(AppError::Message("账户名称不能为空".into()))
+            Err(AppError::Message(ui.tr("error-empty-account-name")))
         }
         Modal::Rename => ui
             .selected_id()
-            .ok_or_else(|| AppError::Message("账户不存在".into()))
+            .ok_or_else(|| AppError::Message(ui.tr("error-account-missing")))
             .and_then(|index| {
-                rename_account(&mut ui.index, paths, index, value.trim().to_string())
+                rename_account(
+                    &ui.config,
+                    &mut ui.index,
+                    paths,
+                    index,
+                    value.trim().to_string(),
+                )
             }),
         Modal::Settings => {
             let path = PathBuf::from(value.trim());
             if path.as_os_str().is_empty() {
-                Err(AppError::Message("路径不能为空".into()))
+                Err(AppError::Message(ui.tr("error-empty-path")))
             } else {
                 let mut candidate = ui.config.clone();
                 candidate.codex_home = path;
@@ -956,11 +1030,11 @@ fn enqueue_control(
     method: Method,
     endpoint: &str,
     body: Option<serde_json::Value>,
-    success: &str,
+    success: impl Into<String>,
 ) {
     let paths = paths.clone();
     let endpoint = endpoint.to_string();
-    let success = success.to_string();
+    let success = success.into();
     let sender = ui.action_sender.clone();
     std::thread::spawn(move || {
         let result = tokio::runtime::Runtime::new()
@@ -979,7 +1053,7 @@ fn enqueue_control(
         };
         let _ = sender.send(update);
     });
-    ui.notice = "正在执行…".into();
+    ui.notice = ui.tr("notice-working");
 }
 
 #[cfg(test)]
@@ -988,12 +1062,9 @@ mod tests {
     use crate::{config::Config, types::AccountIndex};
 
     fn ui() -> Ui {
-        Ui::new(
-            Config::defaults(),
-            AccountIndex::default(),
-            None,
-            Workspace::Accounts,
-        )
+        let mut config = Config::defaults();
+        config.language = LanguagePreference::ZhCn;
+        Ui::new(config, AccountIndex::default(), None, Workspace::Accounts)
     }
 
     fn key(character: char) -> KeyEvent {
@@ -1196,6 +1267,7 @@ mod tests {
                 kind: format!("event-{index}"),
                 account_id: None,
                 detail: "safe".into(),
+                message: None,
             })
             .collect();
         let root = crate::paths::paths();
@@ -1212,5 +1284,44 @@ mod tests {
         ui.recent_events.truncate(1);
         ui.clamp_event_selection();
         assert_eq!(ui.event_selected, 0);
+    }
+
+    #[test]
+    fn language_selector_saves_and_applies_selection() {
+        let paths = test_paths();
+        let mut ui = ui();
+        ui.config.codex_home = paths.config_dir.join("codex");
+        handle_key(key('l'), &paths, &mut ui).unwrap();
+        assert_eq!(ui.modal, Modal::LanguageSelector);
+        handle_key(key('3'), &paths, &mut ui).unwrap();
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &paths,
+            &mut ui,
+        )
+        .unwrap();
+        assert_eq!(ui.config.language, LanguagePreference::En);
+        assert_eq!(
+            crate::config::load_config(&paths).unwrap().language,
+            LanguagePreference::En
+        );
+    }
+
+    #[test]
+    fn failed_language_save_keeps_the_previous_runtime_language() {
+        let paths = test_paths();
+        let mut ui = ui();
+        ui.config.language = LanguagePreference::ZhCn;
+        ui.config.codex_home = PathBuf::from("relative/.codex");
+        handle_key(key('l'), &paths, &mut ui).unwrap();
+        handle_key(key('3'), &paths, &mut ui).unwrap();
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &paths,
+            &mut ui,
+        )
+        .unwrap();
+        assert_eq!(ui.config.language, LanguagePreference::ZhCn);
+        assert_eq!(ui.modal, Modal::LanguageSelector);
     }
 }

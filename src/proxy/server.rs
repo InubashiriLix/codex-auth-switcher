@@ -209,6 +209,10 @@ impl ProxyServer {
             kind: kind.into(),
             account_id,
             detail: detail.into(),
+            message: Some(crate::i18n::LocalizedMessage::new(format!(
+                "event-{}",
+                kind.replace('_', "-")
+            ))),
         });
     }
 
@@ -511,6 +515,7 @@ impl ProxyServer {
                 response_bytes: 0,
                 account_id: Some(route.account_id),
                 route_reason: route.reason.clone(),
+                route_message: localized_route_message(&route.reason),
                 retries: retries as u32,
                 partial_failure: false,
             }),
@@ -623,6 +628,22 @@ impl ProxyServer {
     pub fn attach_metadata_store(&self, store: Arc<MetadataStore>) {
         *self.metadata_store.write() = Some(store);
     }
+}
+
+fn localized_route_message(reason: &str) -> Option<crate::i18n::LocalizedMessage> {
+    let key = match reason {
+        "会话/进程粘性" => "route-sticky",
+        "用户手动选择" => "route-manual",
+        _ if reason.ends_with(" 策略") => "route-strategy",
+        _ => return None,
+    };
+    let mut message = crate::i18n::LocalizedMessage::new(key);
+    if key == "route-strategy" {
+        message
+            .args
+            .insert("strategy".into(), reason.trim_end_matches(" 策略").into());
+    }
+    Some(message)
 }
 
 fn target_url(target_base: &str, uri: &hyper::Uri) -> Result<String> {

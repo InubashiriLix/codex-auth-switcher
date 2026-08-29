@@ -1,4 +1,4 @@
-use crate::{error::*, paths::Paths, types::Theme};
+use crate::{error::*, i18n::LanguagePreference, paths::Paths, types::Theme};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,6 +18,8 @@ pub struct Config {
     pub accounts_dir: PathBuf,
     #[serde(default)]
     pub theme: Theme,
+    #[serde(default)]
+    pub language: LanguagePreference,
     #[serde(default)]
     pub mode: OperationMode,
     #[serde(default)]
@@ -46,6 +48,7 @@ impl Config {
                 .unwrap_or_else(|| home.join(".codex")),
             accounts_dir: data.join("codex-switcher").join("accounts"),
             theme: Theme::default(),
+            language: LanguagePreference::default(),
             mode: OperationMode::Interactive,
             proxy: ProxyConfig::default(),
             retention: RetentionConfig::default(),
@@ -378,5 +381,20 @@ mod tests {
         let error = save_config(&paths, &config).unwrap_err().to_string();
         assert!(error.contains("绝对路径"));
         assert!(!paths.config_file.exists());
+    }
+
+    #[test]
+    fn language_preference_is_backward_compatible_and_persistent() {
+        let mut old: Config =
+            toml::from_str("codex_home = '/tmp/codex'\naccounts_dir = '/tmp/accounts'\n").unwrap();
+        assert_eq!(old.language, LanguagePreference::Auto);
+
+        let paths = test_paths();
+        old.language = LanguagePreference::Fr;
+        save_config(&paths, &old).unwrap();
+        assert_eq!(
+            load_config(&paths).unwrap().language,
+            LanguagePreference::Fr
+        );
     }
 }
