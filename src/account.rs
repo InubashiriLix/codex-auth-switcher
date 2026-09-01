@@ -19,11 +19,44 @@ pub fn load_index(p: &Paths) -> Result<AccountIndex> {
         return Ok(AccountIndex::default());
     }
     reject_symlink(&p.index_file)?;
-    Ok(toml::from_str(&fs::read_to_string(&p.index_file)?)?)
+    let index: AccountIndex = toml::from_str(&fs::read_to_string(&p.index_file)?)?;
+    // StatusKind gained runtime-only states after the initial on-disk format.
+    // Normalize the TOML mirror when a current binary opens it so an older
+    // binary can still recover the account list instead of failing at startup.
+    if needs_legacy_status_mirror(&index) {
+        save_index(p, &index)?;
+    }
+    Ok(index)
 }
 
 pub fn save_index(p: &Paths, i: &AccountIndex) -> Result<()> {
-    atomic_write(&p.index_file, toml::to_string_pretty(i)?.as_bytes())
+    let mut mirror = i.clone();
+    for account in &mut mirror.accounts {
+        account.status.kind = legacy_status(&account.status.kind);
+    }
+    atomic_write(&p.index_file, toml::to_string_pretty(&mirror)?.as_bytes())
+}
+
+fn needs_legacy_status_mirror(index: &AccountIndex) -> bool {
+    index.accounts.iter().any(|account| {
+        !matches!(
+            account.status.kind,
+            StatusKind::Live
+                | StatusKind::Exhausted
+                | StatusKind::Reauth
+                | StatusKind::AccessDenied
+                | StatusKind::Invalid
+                | StatusKind::Unknown
+        )
+    })
+}
+
+fn legacy_status(kind: &StatusKind) -> StatusKind {
+    match kind {
+        StatusKind::RateLimited => StatusKind::Exhausted,
+        StatusKind::TemporaryFailure | StatusKind::Disabled => StatusKind::Unknown,
+        kind => kind.clone(),
+    }
 }
 
 pub fn snapshot_path(config: &Config, id: Uuid) -> std::path::PathBuf {
@@ -152,14 +185,29 @@ pub fn import_value(
     source: String,
     name: Option<String>,
 ) -> Result<()> {
+    if let Some(accounts) = value.get("accounts").and_then(Value::as_array) {
+        return import_sub2api_bundle(config, index, accounts, source, name);
+    }
     let (canonical, _access, account_id, email, plan) = auth_tokens(&value)?;
     ensure_private_dir(&config.accounts_dir)?;
-    let id = Uuid::new_v4();
+    let existing = index.accounts.iter().position(|account| {
+        account_id
+            .as_ref()
+            .zip(account.account_id.as_ref())
+            .is_some_and(|(left, right)| left == right)
+            || email
+                .as_ref()
+                .zip(account.email.as_ref())
+                .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+    });
+    let id = existing
+        .map(|position| index.accounts[position].id)
+        .unwrap_or_else(Uuid::new_v4);
     atomic_write(
         &snapshot_path(config, id),
         serde_json::to_vec_pretty(&canonical)?.as_slice(),
     )?;
-    let label = name.unwrap_or_else(|| {
+    let label = name.clone().unwrap_or_else(|| {
         email.clone().unwrap_or_else(|| {
             Path::new(&source)
                 .file_stem()
@@ -168,19 +216,153 @@ pub fn import_value(
                 .to_string()
         })
     });
-    index.accounts.push(Account {
-        id,
-        label,
-        source,
-        imported_at: Utc::now(),
-        email,
-        plan,
-        account_id,
-        status: CheckStatus::default(),
-        tenant_id: "local".into(),
-        proxy_enabled: false,
-    });
+    if let Some(position) = existing {
+        let account = &mut index.accounts[position];
+        account.source = source;
+        account.imported_at = Utc::now();
+        account.email = email.or_else(|| account.email.clone());
+        account.plan = plan.or_else(|| account.plan.clone());
+        account.account_id = account_id.or_else(|| account.account_id.clone());
+        account.status = CheckStatus::default();
+        account.revision = account.revision.saturating_add(1);
+        if let Some(name) = name {
+            account.label = name;
+        }
+    } else {
+        index.accounts.push(Account {
+            id,
+            label,
+            source,
+            imported_at: Utc::now(),
+            email,
+            plan,
+            account_id,
+            status: CheckStatus::default(),
+            tenant_id: "local".into(),
+            proxy_enabled: false,
+            enabled: true,
+            priority: default_account_priority(),
+            concurrency_limit: default_account_concurrency_limit(),
+            revision: 1,
+        });
+    }
     Ok(())
+}
+
+fn import_sub2api_bundle(
+    config: &Config,
+    index: &mut AccountIndex,
+    entries: &[Value],
+    source: String,
+    name: Option<String>,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Err(AppError::Message("Sub2API 导入包不含任何账户".into()));
+    }
+    let apply_name = (entries.len() == 1).then_some(name).flatten();
+    for (position, entry) in entries.iter().enumerate() {
+        let (auth, entry_name, priority, concurrency_limit, enabled) =
+            sub2api_account(entry, position + 1)?;
+        let (_, _, account_id, email, _) = auth_tokens(&auth)?;
+        import_value(
+            config,
+            index,
+            auth,
+            format!("{source}#{}", position + 1),
+            apply_name.clone().or(entry_name),
+        )?;
+        if let Some(account) = index.accounts.iter_mut().find(|account| {
+            account_id
+                .as_ref()
+                .zip(account.account_id.as_ref())
+                .is_some_and(|(left, right)| left == right)
+                || email
+                    .as_ref()
+                    .zip(account.email.as_ref())
+                    .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+        }) {
+            account.priority = priority;
+            account.concurrency_limit = concurrency_limit;
+            account.enabled = enabled;
+            if !enabled {
+                account.proxy_enabled = false;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sub2api_account(
+    entry: &Value,
+    position: usize,
+) -> Result<(Value, Option<String>, i32, usize, bool)> {
+    let credentials = entry
+        .get("credentials")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            AppError::Message(format!("Sub2API 第 {position} 个账户缺少 credentials"))
+        })?;
+    let string = |key: &str| {
+        credentials
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let access = string("access_token")
+        .or_else(|| string("accessToken"))
+        .ok_or_else(|| {
+            AppError::Message(format!("Sub2API 第 {position} 个账户未找到 access token"))
+        })?;
+    let account_id = string("chatgpt_account_id").or_else(|| string("account_id"));
+    let email = string("email")
+        .or_else(|| entry.pointer("/extra/email").and_then(Value::as_str))
+        .or_else(|| entry.get("email").and_then(Value::as_str));
+    let plan = string("plan_type").or_else(|| entry.get("plan_type").and_then(Value::as_str));
+    let label = entry
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    let priority = entry
+        .get("priority")
+        .and_then(Value::as_i64)
+        .unwrap_or(default_account_priority() as i64)
+        .clamp(-10_000, 10_000) as i32;
+    let concurrency_limit = entry
+        .get("concurrency")
+        .and_then(Value::as_u64)
+        .unwrap_or(default_account_concurrency_limit() as u64)
+        .min(10_000) as usize;
+    let enabled = !entry
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| matches!(status, "disabled" | "deleted"));
+    Ok((
+        json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": access,
+                "refresh_token": string("refresh_token").unwrap_or(""),
+                "id_token": string("id_token").unwrap_or(""),
+                "account_id": account_id,
+            },
+            "email": email,
+            "plan_type": plan,
+        }),
+        label,
+        priority,
+        concurrency_limit,
+        enabled,
+    ))
+}
+
+fn default_account_priority() -> i32 {
+    100
+}
+
+fn default_account_concurrency_limit() -> usize {
+    1
 }
 
 pub fn import_file(config: &Config, index: &mut AccountIndex, path: &Path) -> Result<()> {
@@ -197,6 +379,34 @@ pub fn import_file(config: &Config, index: &mut AccountIndex, path: &Path) -> Re
 
 pub fn import_current(config: &Config, index: &mut AccountIndex) -> Result<()> {
     import_file(config, index, &config.codex_home.join("auth.json"))
+}
+
+/// Replace a known account's credentials with the user's current official
+/// Codex login.  Unlike importing, this intentionally keeps the account ID,
+/// label and scheduling settings so a reauthentication never changes routing
+/// behaviour or historic attribution.
+pub fn update_from_current(config: &Config, index: &mut AccountIndex, id: Uuid) -> Result<()> {
+    let raw = fs::read_to_string(config.codex_home.join("auth.json"))?;
+    let value: Value = serde_json::from_str(&raw)?;
+    let (canonical, _access, account_id, email, plan) = auth_tokens(&value)?;
+    let account = index
+        .accounts
+        .iter_mut()
+        .find(|account| account.id == id)
+        .ok_or_else(|| AppError::Message("找不到要更新的账户".into()))?;
+    ensure_private_dir(&config.accounts_dir)?;
+    atomic_write(
+        &snapshot_path(config, id),
+        serde_json::to_vec_pretty(&canonical)?.as_slice(),
+    )?;
+    account.source = "current-codex-login".into();
+    account.imported_at = Utc::now();
+    account.email = email.or_else(|| account.email.clone());
+    account.plan = plan.or_else(|| account.plan.clone());
+    account.account_id = account_id.or_else(|| account.account_id.clone());
+    account.status = CheckStatus::default();
+    account.revision = account.revision.saturating_add(1);
+    Ok(())
 }
 
 pub fn activate(config: &Config, account: &Account) -> Result<()> {
@@ -351,7 +561,7 @@ pub fn probe(config: &Config, account: &mut Account) {
         })
     })();
     account.status = result.unwrap_or_else(|e| CheckStatus {
-        kind: StatusKind::Unknown,
+        kind: StatusKind::TemporaryFailure,
         checked_at: Some(Utc::now()),
         detail: e.to_string(),
         primary: None,
@@ -422,6 +632,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn toml_mirror_uses_only_legacy_status_names() {
+        assert_eq!(
+            legacy_status(&StatusKind::RateLimited),
+            StatusKind::Exhausted
+        );
+        assert_eq!(
+            legacy_status(&StatusKind::TemporaryFailure),
+            StatusKind::Unknown
+        );
+        assert_eq!(legacy_status(&StatusKind::Disabled), StatusKind::Unknown);
+    }
+
+    #[test]
+    fn sub2api_bundle_imports_credentials_and_scheduling() {
+        let root = std::env::temp_dir().join(format!("codex-switcher-sub2api-{}", Uuid::new_v4()));
+        let mut config = Config::defaults();
+        config.accounts_dir = root.join("accounts");
+        let mut index = AccountIndex::default();
+        import_value(
+            &config,
+            &mut index,
+            json!({
+                "type": "sub2api-data",
+                "version": 1,
+                "accounts": [
+                    {
+                        "name": "first@example.test",
+                        "credentials": {
+                            "access_token": "first-access",
+                            "refresh_token": "first-refresh",
+                            "chatgpt_account_id": "account-first",
+                            "plan_type": "plus"
+                        },
+                        "extra": {"email": "first@example.test"},
+                        "priority": 7,
+                        "concurrency": 3
+                    },
+                    {
+                        "name": "disabled@example.test",
+                        "credentials": {
+                            "access_token": "second-access",
+                            "chatgpt_account_id": "account-second"
+                        },
+                        "status": "disabled"
+                    }
+                ]
+            }),
+            "sub2api.json".into(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(index.accounts.len(), 2);
+        assert_eq!(index.accounts[0].label, "first@example.test");
+        assert_eq!(index.accounts[0].priority, 7);
+        assert_eq!(index.accounts[0].concurrency_limit, 3);
+        assert_eq!(index.accounts[0].plan.as_deref(), Some("plus"));
+        assert!(!index.accounts[1].enabled);
+        assert!(!index.accounts[1].proxy_enabled);
+        assert!(snapshot_path(&config, index.accounts[0].id).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn activation_rejects_invalid_home_before_filesystem_access() {
         let mut config = Config::defaults();
         config.codex_home = Path::new("not-an-absolute-codex-home").to_path_buf();
@@ -436,10 +709,60 @@ mod tests {
             status: CheckStatus::default(),
             tenant_id: "local".into(),
             proxy_enabled: false,
+            enabled: true,
+            priority: 100,
+            concurrency_limit: 0,
+            revision: 1,
         };
 
         let error = activate(&config, &account).unwrap_err().to_string();
         assert!(error.contains("Codex 目录配置无效"));
         assert!(!error.contains("os error 36"));
+    }
+
+    #[test]
+    fn updating_from_current_preserves_routing_configuration() {
+        let root = std::env::temp_dir().join(format!("codex-switcher-update-{}", Uuid::new_v4()));
+        let mut config = Config::defaults();
+        config.codex_home = root.join("codex");
+        config.accounts_dir = root.join("accounts");
+        fs::create_dir_all(&config.codex_home).unwrap();
+        fs::write(
+            config.codex_home.join("auth.json"),
+            r#"{"tokens":{"access_token":"new-token","account_id":"new-account"},"email":"new@example.test"}"#,
+        )
+        .unwrap();
+        let id = Uuid::new_v4();
+        let mut index = AccountIndex {
+            accounts: vec![Account {
+                id,
+                label: "keep-label".into(),
+                source: "old".into(),
+                imported_at: Utc::now(),
+                email: Some("old@example.test".into()),
+                plan: None,
+                account_id: Some("old-account".into()),
+                status: CheckStatus::default(),
+                tenant_id: "local".into(),
+                proxy_enabled: true,
+                enabled: true,
+                priority: 7,
+                concurrency_limit: 3,
+                revision: 4,
+            }],
+        };
+        update_from_current(&config, &mut index, id).unwrap();
+        let account = &index.accounts[0];
+        assert_eq!(account.label, "keep-label");
+        assert!(account.proxy_enabled);
+        assert_eq!(account.priority, 7);
+        assert_eq!(account.concurrency_limit, 3);
+        assert_eq!(account.account_id.as_deref(), Some("new-account"));
+        assert!(
+            fs::read_to_string(snapshot_path(&config, id))
+                .unwrap()
+                .contains("new-token")
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

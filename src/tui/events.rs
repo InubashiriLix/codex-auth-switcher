@@ -1,5 +1,6 @@
 use super::{
-    DetailPage, HelpPage, InputSuggestion, Modal, ProxyPanel, Ui, Workspace, actions::*, draw,
+    ActionUpdate, DetailPage, HelpPage, InputSuggestion, Modal, ProxyPanel, Ui, Workspace,
+    actions::*, draw,
 };
 use crate::{
     error::{AppError, Result},
@@ -236,12 +237,50 @@ fn handle_account_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool>
                     "notice-checking-account",
                     [("account", account.label.as_str())],
                 );
-                start_probe(ui, vec![account]);
+                if ui.attached_daemon {
+                    enqueue_control(
+                        paths,
+                        ui,
+                        Method::POST,
+                        &format!("/v1/accounts/{}/probe", account.id),
+                        None,
+                        ui.tr("notice-checking-selected"),
+                    );
+                } else {
+                    start_probe(ui, vec![account]);
+                }
             }
         }
         KeyCode::Char('R') => {
-            ui.notice = ui.tr("notice-checking-all");
-            start_probe(ui, ui.index.accounts.clone());
+            if ui.attached_daemon {
+                enqueue_control(
+                    paths,
+                    ui,
+                    Method::POST,
+                    "/v1/accounts/probe-all",
+                    None,
+                    ui.tr("notice-checking-all"),
+                );
+            } else {
+                ui.notice = ui.tr("notice-checking-all");
+                start_probe(ui, ui.index.accounts.clone());
+            }
+        }
+        KeyCode::Char('u') => {
+            if let Some(index) = ui.selected_id() {
+                ui.notice = update_account_from_current(&ui.config, &mut ui.index, paths, index)
+                    .unwrap_or_else(|error| error.to_string());
+                if ui.attached_daemon {
+                    ui.pending_index_sync = true;
+                }
+            }
+        }
+        KeyCode::Char('D') => {
+            ui.notice = run_doctor(&ui.config, &ui.index, paths);
+        }
+        KeyCode::Char('b') => {
+            ui.notice = export_support_bundle(&ui.config, &ui.index, paths)
+                .unwrap_or_else(|error| error.to_string());
         }
         KeyCode::Enter => {
             if let Some(index) = ui.selected_id() {
@@ -275,13 +314,35 @@ fn handle_proxy_key(key: KeyEvent, paths: &Paths, ui: &mut Ui) -> Result<bool> {
         KeyCode::Char(' ') if ui.proxy_panel == ProxyPanel::Pool => toggle_pool(paths, ui),
         KeyCode::Char('r') if ui.proxy_panel == ProxyPanel::Pool => {
             if let Some(index) = ui.pool_selected_id() {
-                start_probe(ui, vec![ui.index.accounts[index].clone()]);
-                ui.notice = ui.tr("notice-checking-selected");
+                if ui.attached_daemon {
+                    enqueue_control(
+                        paths,
+                        ui,
+                        Method::POST,
+                        &format!("/v1/accounts/{}/probe", ui.index.accounts[index].id),
+                        None,
+                        ui.tr("notice-checking-selected"),
+                    );
+                } else {
+                    start_probe(ui, vec![ui.index.accounts[index].clone()]);
+                    ui.notice = ui.tr("notice-checking-selected");
+                }
             }
         }
         KeyCode::Char('R') if ui.proxy_panel == ProxyPanel::Pool => {
-            start_probe(ui, ui.index.accounts.clone());
-            ui.notice = ui.tr("notice-checking-all");
+            if ui.attached_daemon {
+                enqueue_control(
+                    paths,
+                    ui,
+                    Method::POST,
+                    "/v1/accounts/probe-all",
+                    None,
+                    ui.tr("notice-checking-all"),
+                );
+            } else {
+                start_probe(ui, ui.index.accounts.clone());
+                ui.notice = ui.tr("notice-checking-all");
+            }
         }
         KeyCode::Char('x') if ui.proxy_panel == ProxyPanel::Pool => switch_route(paths, ui),
         KeyCode::Char('s') => {
@@ -384,9 +445,9 @@ fn toggle_pool(paths: &Paths, ui: &mut Ui) {
                 ui.tr("notice-pool-removed")
             },
         );
-        ui.index.accounts[index].proxy_enabled = enabled;
     } else {
         ui.index.accounts[index].proxy_enabled = enabled;
+        ui.index.accounts[index].revision = ui.index.accounts[index].revision.saturating_add(1);
         ui.notice = match crate::account::save_index(paths, &ui.index) {
             Ok(()) if enabled => ui.tr("notice-pool-added"),
             Ok(()) => ui.tr("notice-pool-removed"),
@@ -452,8 +513,34 @@ fn start_proxy(paths: &Paths, ui: &mut Ui) {
             .cloned()
             .collect::<Vec<_>>();
         if !pool.is_empty() {
-            ui.start_after_probe = true;
-            start_probe(ui, pool);
+            let paths = paths.clone();
+            let sender = ui.action_sender.clone();
+            std::thread::spawn(move || {
+                let result = tokio::runtime::Runtime::new()
+                    .map_err(AppError::from)
+                    .and_then(|runtime| {
+                        runtime.block_on(async {
+                            crate::daemon::control_request_json(
+                                &paths,
+                                Method::POST,
+                                "/v1/accounts/probe-all",
+                                None,
+                            )
+                            .await?;
+                            crate::daemon::control_request_json(
+                                &paths,
+                                Method::POST,
+                                "/v1/proxy/start",
+                                None,
+                            )
+                            .await
+                        })
+                    });
+                let _ = sender.send(match result {
+                    Ok(_) => ActionUpdate::Success("账户检测完成，代理已启动".into()),
+                    Err(error) => ActionUpdate::Error(error.to_string()),
+                });
+            });
             ui.notice = ui.tr("notice-checking-all");
             return;
         }

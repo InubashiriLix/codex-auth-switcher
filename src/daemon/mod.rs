@@ -52,10 +52,27 @@ pub struct DaemonState {
     pub recommender: Recommender,
     pub paths: Paths,
     pub metadata_store: Arc<MetadataStore>,
+    pub accounts_revision: Arc<RwLock<u64>>,
 }
 
 impl DaemonState {
     pub fn new(config: Config, index: AccountIndex, paths: Paths) -> Result<Self> {
+        let metadata_store = Arc::new(MetadataStore::open(
+            &paths.database_file,
+            RetentionPolicy {
+                days: config.retention.days,
+                max_requests: config.retention.max_requests,
+                max_events: config.retention.max_events,
+            },
+        )?);
+        if metadata_store.accounts_revision()? == 0 && paths.index_file.exists() {
+            let backup = paths.index_file.with_extension("toml.pre-sqlite.bak");
+            if !backup.exists() {
+                fs::copy(&paths.index_file, backup)?;
+            }
+        }
+        let (index, revision) = metadata_store.reconcile_accounts(&index)?;
+        let accounts_revision = Arc::new(RwLock::new(revision));
         let accounts = Arc::new(RwLock::new(index));
         let current_account = Arc::new(RwLock::new(Self::find_active_account(&config, &accounts)));
         let proxy_state = ProxyState::new();
@@ -76,14 +93,6 @@ impl DaemonState {
 
         let recommender = Recommender::new(config.proxy.strategy.clone());
         let hot_reloader = HotReloader::new(&paths)?;
-        let metadata_store = Arc::new(MetadataStore::open(
-            &paths.database_file,
-            RetentionPolicy {
-                days: config.retention.days,
-                max_requests: config.retention.max_requests,
-                max_events: config.retention.max_events,
-            },
-        )?);
         proxy_server.attach_metadata_store(metadata_store.clone());
 
         Ok(Self {
@@ -97,6 +106,7 @@ impl DaemonState {
             recommender,
             paths,
             metadata_store,
+            accounts_revision,
         })
     }
 
@@ -127,6 +137,8 @@ impl DaemonState {
             ReloadEvent::AccountsChanged => {
                 info!("Accounts changed, reloading...");
                 let new_index = load_index(&self.paths)?;
+                let revision = self.metadata_store.replace_accounts(&new_index)?;
+                let new_index = self.metadata_store.load_accounts()?;
 
                 // 检查当前活跃账户是否还存在
                 let current_id = *self.current_account.read();
@@ -141,6 +153,7 @@ impl DaemonState {
 
                 // 更新账户列表
                 *self.accounts.write() = new_index;
+                *self.accounts_revision.write() = revision;
                 info!("Account index reloaded");
             }
 
@@ -182,7 +195,7 @@ impl DaemonState {
         if let Some(account) = index
             .accounts
             .iter()
-            .find(|a| a.status.kind == StatusKind::Live)
+            .find(|a| a.enabled && a.proxy_enabled && a.status.kind == StatusKind::Live)
         {
             *self.current_account.write() = Some(account.id);
             self.proxy_state.stats.write().current_account = Some(account.id);
@@ -304,6 +317,7 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
         paths: paths.clone(),
         shutdown: shutdown_tx.clone(),
         metadata_store: state.metadata_store.clone(),
+        accounts_revision: state.accounts_revision.clone(),
     })
     .await?;
     let control_handle = tokio::spawn(async move {
@@ -354,7 +368,12 @@ async fn run_daemon_impl(config: Config, index: AccountIndex, paths: Paths) -> R
                 state.current_account.clone(),
                 &state.config.proxy,
             )
-            .with_router(state.proxy_server.router().clone()),
+            .with_router(state.proxy_server.router().clone())
+            .with_store(
+                state.metadata_store.clone(),
+                state.accounts_revision.clone(),
+                state.paths.clone(),
+            ),
         );
         tokio::spawn(async move {
             monitor.start_monitoring().await;
@@ -446,9 +465,12 @@ async fn shutdown_gracefully(state: &DaemonState) -> Result<()> {
 async fn force_reload_all(state: &mut DaemonState) -> Result<()> {
     let new_config = load_config(&state.paths)?;
     let new_index = load_index(&state.paths)?;
+    let revision = state.metadata_store.replace_accounts(&new_index)?;
+    let new_index = state.metadata_store.load_accounts()?;
 
     state.config = new_config;
     *state.accounts.write() = new_index;
+    *state.accounts_revision.write() = revision;
 
     info!("Full reload completed");
     Ok(())
@@ -468,13 +490,15 @@ impl Clone for DaemonState {
             recommender: Recommender::new(self.config.proxy.strategy.clone()),
             paths: self.paths.clone(),
             metadata_store: self.metadata_store.clone(),
+            accounts_revision: self.accounts_revision.clone(),
         }
     }
 }
 
 fn has_eligible_proxy_account(index: &AccountIndex, threshold: f64) -> bool {
     index.accounts.iter().any(|account| {
-        account.proxy_enabled
+        account.enabled
+            && account.proxy_enabled
             && account.status.kind == StatusKind::Live
             && account.status.checked_at.is_some_and(|checked| {
                 Utc::now().signed_duration_since(checked).num_seconds() <= 90

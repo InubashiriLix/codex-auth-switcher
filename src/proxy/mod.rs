@@ -1,10 +1,12 @@
 mod auth;
 mod connection_tracker;
+mod fingerprint;
 mod monitor;
 mod recommender;
 mod routing;
 mod server;
 mod switcher;
+mod upstream_error;
 
 pub use auth::{RefreshOutcome, TokenRefresher};
 pub use connection_tracker::{ConnectionTracker, InFlightRequest};
@@ -13,6 +15,7 @@ pub use recommender::Recommender;
 pub use routing::{CircuitReason, RouteDecision, RouteError, Router};
 pub use server::ProxyServer;
 pub use switcher::{AccountSwitcher, SwitchDecision, SwitchReason, SwitchRecord};
+pub use upstream_error::{UpstreamFailure, UpstreamFailureKind};
 
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};

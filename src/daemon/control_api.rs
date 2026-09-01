@@ -1,6 +1,7 @@
 use crate::{
     account::save_index,
     config::{Config, RecommendStrategy, save_config},
+    diagnostics,
     error::{AppError, Result},
     i18n::LanguagePreference,
     integration::CodexIntegration,
@@ -28,7 +29,7 @@ use std::{
     convert::Infallible,
     fs,
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
 };
 use tokio::{net::TcpListener, sync::watch};
@@ -67,6 +68,8 @@ pub struct HealthSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControlSnapshot {
     pub protocol_version: u32,
+    #[serde(default)]
+    pub accounts_revision: u64,
     pub tenant_id: String,
     pub proxy: ProxySnapshot,
     pub stats: crate::proxy::ProxyStats,
@@ -123,6 +126,7 @@ pub struct ControlContext {
     pub paths: Paths,
     pub shutdown: watch::Sender<bool>,
     pub metadata_store: Arc<MetadataStore>,
+    pub accounts_revision: Arc<RwLock<u64>>,
 }
 
 pub struct ControlServer {
@@ -208,8 +212,130 @@ async fn handle(
     }
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
+    let network_check = request
+        .uri()
+        .query()
+        .is_some_and(|query| query.split('&').any(|item| item == "network=true"));
 
     let response = match (method, path.as_str()) {
+        (Method::GET, "/v1/accounts") => json_response(
+            StatusCode::OK,
+            json!({
+                "accounts_revision": *context.accounts_revision.read(),
+                "accounts": context.accounts.read().accounts.clone(),
+            }),
+        ),
+        (Method::POST, "/v1/accounts/import") => {
+            match collect_json::<AccountImport>(request).await {
+                Ok(import) => {
+                    let mut index = context.accounts.read().clone();
+                    let config = context.config.read().clone();
+                    let result = if let Some(value) = import.value {
+                        crate::account::import_value(
+                            &config,
+                            &mut index,
+                            value,
+                            "control-api".into(),
+                            import.name,
+                        )
+                    } else if let Some(path) = import.path {
+                        crate::account::import_file(
+                            &config,
+                            &mut index,
+                            std::path::Path::new(&path),
+                        )
+                    } else {
+                        crate::account::import_current(&config, &mut index)
+                    };
+                    match result.and_then(|_| commit_accounts(&context, &index)) {
+                        Ok(revision) => {
+                            record_control_event(
+                                &context,
+                                "account_imported",
+                                None,
+                                "OAuth 账户已导入",
+                            );
+                            json_response(
+                                StatusCode::OK,
+                                json!({"ok":true,"accounts_revision":revision}),
+                            )
+                        }
+                        Err(error) => {
+                            json_response(StatusCode::CONFLICT, json!({"error":error.to_string()}))
+                        }
+                    }
+                }
+                Err(error) => {
+                    json_response(StatusCode::BAD_REQUEST, json!({"error":error.to_string()}))
+                }
+            }
+        }
+        (Method::POST, "/v1/accounts/probe-all") => {
+            let mut index = context.accounts.read().clone();
+            let config = context.config.read().clone();
+            let result = tokio::task::spawn_blocking(move || {
+                for account in &mut index.accounts {
+                    crate::account::probe(&config, account);
+                    account.revision = account.revision.saturating_add(1);
+                }
+                index
+            })
+            .await;
+            match result {
+                Ok(index) => match commit_accounts(&context, &index) {
+                    Ok(revision) => json_response(
+                        StatusCode::OK,
+                        json!({"ok":true,"accounts_revision":revision}),
+                    ),
+                    Err(error) => {
+                        json_response(StatusCode::CONFLICT, json!({"error":error.to_string()}))
+                    }
+                },
+                Err(error) => json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error":error.to_string()}),
+                ),
+            }
+        }
+        (Method::GET, "/v1/doctor") => {
+            let report = diagnostics::doctor(
+                &context.config.read(),
+                &context.paths,
+                &context.accounts.read(),
+                network_check,
+            );
+            json_response(
+                StatusCode::OK,
+                serde_json::to_value(report)
+                    .unwrap_or_else(|_| json!({"error":"doctor serialization failed"})),
+            )
+        }
+        (Method::POST, "/v1/support-bundle") => {
+            match collect_json::<SupportBundleRequest>(request).await {
+                Ok(bundle) => {
+                    let output = PathBuf::from(bundle.output);
+                    match diagnostics::write_support_bundle(
+                        &output,
+                        &context.config.read(),
+                        &context.paths,
+                        &context.accounts.read(),
+                        Some(&context.metadata_store),
+                        bundle.network,
+                    ) {
+                        Ok(report) => json_response(
+                            StatusCode::OK,
+                            json!({"ok":true,"output":output,"report":report}),
+                        ),
+                        Err(error) => {
+                            json_response(StatusCode::CONFLICT, json!({"error":error.to_string()}))
+                        }
+                    }
+                }
+                Err(error) => {
+                    json_response(StatusCode::BAD_REQUEST, json!({"error":error.to_string()}))
+                }
+            }
+        }
         (Method::GET, "/v1/snapshot") => {
             let config = context.config.read();
             let database_counts = context.metadata_store.counts().ok();
@@ -217,7 +343,8 @@ async fn handle(
             let eligible_accounts = accounts
                 .iter()
                 .filter(|account| {
-                    account.proxy_enabled
+                    account.enabled
+                        && account.proxy_enabled
                         && account.status.kind == crate::types::StatusKind::Live
                         && account.status.checked_at.is_some_and(|checked| {
                             chrono::Utc::now()
@@ -283,6 +410,7 @@ async fn handle(
                 StatusCode::OK,
                 serde_json::to_value(ControlSnapshot {
                     protocol_version: CONTROL_PROTOCOL_VERSION,
+                    accounts_revision: *context.accounts_revision.read(),
                     tenant_id: "local".into(),
                     proxy: ProxySnapshot {
                         running: context.proxy_state.running.load(Ordering::Relaxed),
@@ -474,7 +602,8 @@ async fn handle(
         }
         (Method::POST, "/v1/proxy/start") => {
             let eligible = context.accounts.read().accounts.iter().any(|account| {
-                account.proxy_enabled
+                account.enabled
+                    && account.proxy_enabled
                     && account.status.kind == crate::types::StatusKind::Live
                     && account.status.checked_at.is_some_and(|checked| {
                         chrono::Utc::now()
@@ -600,8 +729,15 @@ async fn handle(
                         .router()
                         .update_config(config.proxy.clone());
                     *context.config.write() = config;
-                    *context.accounts.write() = index;
-                    json_response(StatusCode::OK, json!({"ok":true}))
+                    match commit_accounts(&context, &index) {
+                        Ok(revision) => json_response(
+                            StatusCode::OK,
+                            json!({"ok":true,"accounts_revision":revision}),
+                        ),
+                        Err(error) => {
+                            json_response(StatusCode::CONFLICT, json!({"error":error.to_string()}))
+                        }
+                    }
                 }
                 (Err(error), _) | (_, Err(error)) => {
                     json_response(StatusCode::CONFLICT, json!({"error":error.to_string()}))
@@ -625,9 +761,9 @@ async fn handle(
                             if patch.enabled {
                                 context.proxy_server.router().close_circuit(id);
                             }
-                            let result = save_index(&context.paths, &index);
+                            account.revision = account.revision.saturating_add(1);
+                            let result = commit_accounts(&context, &index);
                             if result.is_ok() {
-                                *context.accounts.write() = index;
                                 record_control_event(
                                     &context,
                                     if patch.enabled {
@@ -643,7 +779,16 @@ async fn handle(
                                     },
                                 );
                             }
-                            operation_result(result)
+                            match result {
+                                Ok(revision) => json_response(
+                                    StatusCode::OK,
+                                    json!({"ok":true,"accounts_revision":revision}),
+                                ),
+                                Err(error) => json_response(
+                                    StatusCode::CONFLICT,
+                                    json!({"error":error.to_string()}),
+                                ),
+                            }
                         }
                         None => json_response(
                             StatusCode::NOT_FOUND,
@@ -657,6 +802,266 @@ async fn handle(
                 ),
             }
         }
+        (Method::POST, _) if path.starts_with("/v1/accounts/") && path.ends_with("/probe") => {
+            let id = path
+                .trim_start_matches("/v1/accounts/")
+                .trim_end_matches("/probe")
+                .trim_end_matches('/');
+            match Uuid::parse_str(id) {
+                Ok(id) => {
+                    let mut index = context.accounts.read().clone();
+                    let Some(position) = index.accounts.iter().position(|account| account.id == id)
+                    else {
+                        return Ok(json_response(
+                            StatusCode::NOT_FOUND,
+                            json!({"error":"account not found"}),
+                        ));
+                    };
+                    let config = context.config.read().clone();
+                    let mut account = index.accounts[position].clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::account::probe(&config, &mut account);
+                        account.revision = account.revision.saturating_add(1);
+                        account
+                    })
+                    .await;
+                    match result {
+                        Ok(account) => {
+                            let status = account.status.kind.clone();
+                            index.accounts[position] = account;
+                            match commit_accounts(&context, &index) {
+                                Ok(revision) => {
+                                    if status == crate::types::StatusKind::Live {
+                                        context.proxy_server.router().close_circuit(id);
+                                    } else if status == crate::types::StatusKind::Reauth {
+                                        context.proxy_server.router().open_circuit(
+                                            id,
+                                            crate::proxy::CircuitReason::Reauth,
+                                            None,
+                                        );
+                                    }
+                                    json_response(
+                                        StatusCode::OK,
+                                        json!({"ok":true,"accounts_revision":revision}),
+                                    )
+                                }
+                                Err(error) => json_response(
+                                    StatusCode::CONFLICT,
+                                    json!({"error":error.to_string()}),
+                                ),
+                            }
+                        }
+                        Err(error) => json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({"error":error.to_string()}),
+                        ),
+                    }
+                }
+                Err(_) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":"invalid account id"}),
+                ),
+            }
+        }
+        (Method::POST, _)
+            if path.starts_with("/v1/accounts/") && path.ends_with("/update-current") =>
+        {
+            let id = path
+                .trim_start_matches("/v1/accounts/")
+                .trim_end_matches("/update-current")
+                .trim_end_matches('/');
+            match Uuid::parse_str(id) {
+                Ok(id) => {
+                    let mut index = context.accounts.read().clone();
+                    let config = context.config.read().clone();
+                    match crate::account::update_from_current(&config, &mut index, id)
+                        .and_then(|_| commit_accounts(&context, &index))
+                    {
+                        Ok(revision) => {
+                            context.proxy_server.router().close_circuit(id);
+                            record_control_event(
+                                &context,
+                                "account_reauthenticated",
+                                Some(id),
+                                "已用当前官方登录更新账户快照",
+                            );
+                            json_response(
+                                StatusCode::OK,
+                                json!({"ok":true,"accounts_revision":revision}),
+                            )
+                        }
+                        Err(error) => {
+                            json_response(StatusCode::CONFLICT, json!({"error":error.to_string()}))
+                        }
+                    }
+                }
+                Err(_) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":"invalid account id"}),
+                ),
+            }
+        }
+        (Method::GET, _) if path.starts_with("/v1/accounts/") && path.ends_with("/events") => {
+            let id = path
+                .trim_start_matches("/v1/accounts/")
+                .trim_end_matches("/events")
+                .trim_end_matches('/');
+            match Uuid::parse_str(id) {
+                Ok(id) => match context
+                    .metadata_store
+                    .recent_account_events(Some(id), 200, 0)
+                {
+                    Ok(events) => {
+                        json_response(StatusCode::OK, json!({"account_id":id,"events":events}))
+                    }
+                    Err(error) => json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error":error.to_string()}),
+                    ),
+                },
+                Err(_) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":"invalid account id"}),
+                ),
+            }
+        }
+        (Method::PATCH, _) if path.starts_with("/v1/accounts/") => {
+            let id = path
+                .trim_start_matches("/v1/accounts/")
+                .trim_end_matches('/');
+            match (
+                Uuid::parse_str(id),
+                collect_json::<AccountPatch>(request).await,
+            ) {
+                (Ok(id), Ok(patch)) => {
+                    let mut index = context.accounts.read().clone();
+                    let Some(account) = index.accounts.iter_mut().find(|account| account.id == id)
+                    else {
+                        return Ok(json_response(
+                            StatusCode::NOT_FOUND,
+                            json!({"error":"account not found"}),
+                        ));
+                    };
+                    if let Some(label) = patch.label {
+                        let label = label.trim();
+                        if label.is_empty() {
+                            return Ok(json_response(
+                                StatusCode::BAD_REQUEST,
+                                json!({"error":"label must not be empty"}),
+                            ));
+                        }
+                        account.label = label.to_owned();
+                    }
+                    if let Some(enabled) = patch.enabled {
+                        account.enabled = enabled;
+                        if !enabled {
+                            account.proxy_enabled = false;
+                        }
+                    }
+                    if let Some(proxy_enabled) = patch.proxy_enabled {
+                        account.proxy_enabled = proxy_enabled && account.enabled;
+                    }
+                    if let Some(priority) = patch.priority {
+                        account.priority = priority.clamp(-10_000, 10_000);
+                    }
+                    if let Some(limit) = patch.concurrency_limit {
+                        account.concurrency_limit = limit.min(10_000);
+                    }
+                    account.revision = account.revision.saturating_add(1);
+                    match commit_accounts(&context, &index) {
+                        Ok(revision) => json_response(
+                            StatusCode::OK,
+                            json!({"ok":true,"accounts_revision":revision}),
+                        ),
+                        Err(error) => {
+                            json_response(StatusCode::CONFLICT, json!({"error":error.to_string()}))
+                        }
+                    }
+                }
+                _ => json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":"invalid account or body"}),
+                ),
+            }
+        }
+        (Method::DELETE, _) if path.starts_with("/v1/accounts/") => {
+            let id = path
+                .trim_start_matches("/v1/accounts/")
+                .trim_end_matches('/');
+            match Uuid::parse_str(id) {
+                Ok(id) => {
+                    let mut index = context.accounts.read().clone();
+                    if !index.accounts.iter().any(|account| account.id == id) {
+                        return Ok(json_response(
+                            StatusCode::NOT_FOUND,
+                            json!({"error":"account not found"}),
+                        ));
+                    }
+                    if *context.current_account.read() == Some(id)
+                        && !context
+                            .proxy_server
+                            .connection_tracker()
+                            .in_flight()
+                            .is_empty()
+                    {
+                        return Ok(json_response(
+                            StatusCode::CONFLICT,
+                            json!({"error":"current account has active requests"}),
+                        ));
+                    }
+                    index.accounts.retain(|account| account.id != id);
+                    if *context.current_account.read() == Some(id) {
+                        let replacement = index
+                            .accounts
+                            .iter()
+                            .find(|account| {
+                                account.enabled
+                                    && account.proxy_enabled
+                                    && account.status.kind == crate::types::StatusKind::Live
+                            })
+                            .map(|account| account.id);
+                        if context.proxy_state.running.load(Ordering::Relaxed)
+                            && replacement.is_none()
+                        {
+                            return Ok(json_response(
+                                StatusCode::CONFLICT,
+                                json!({"error":"no safe replacement account"}),
+                            ));
+                        }
+                        *context.current_account.write() = replacement;
+                        context.proxy_state.stats.write().current_account = replacement;
+                        if let Some(replacement) = replacement {
+                            context.proxy_server.router().prefer(replacement);
+                        }
+                    }
+                    match commit_accounts(&context, &index) {
+                        Ok(revision) => {
+                            let profile = crate::account::snapshot_path(&context.config.read(), id);
+                            if profile.exists() {
+                                let _ = fs::remove_file(profile);
+                            }
+                            record_control_event(
+                                &context,
+                                "account_deleted",
+                                Some(id),
+                                "OAuth 账户已删除",
+                            );
+                            json_response(
+                                StatusCode::OK,
+                                json!({"ok":true,"accounts_revision":revision}),
+                            )
+                        }
+                        Err(error) => {
+                            json_response(StatusCode::CONFLICT, json!({"error":error.to_string()}))
+                        }
+                    }
+                }
+                Err(_) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    json!({"error":"invalid account id"}),
+                ),
+            }
+        }
         (Method::POST, _) if path.starts_with("/v1/accounts/") && path.ends_with("/switch") => {
             let id = path
                 .trim_start_matches("/v1/accounts/")
@@ -664,12 +1069,9 @@ async fn handle(
                 .trim_end_matches('/');
             match Uuid::parse_str(id) {
                 Ok(id)
-                    if context
-                        .accounts
-                        .read()
-                        .accounts
-                        .iter()
-                        .any(|account| account.id == id && account.proxy_enabled) =>
+                    if context.accounts.read().accounts.iter().any(|account| {
+                        account.id == id && account.enabled && account.proxy_enabled
+                    }) =>
                 {
                     *context.current_account.write() = Some(id);
                     context.proxy_state.stats.write().current_account = Some(id);
@@ -704,6 +1106,41 @@ struct ConfigPatch {
 #[derive(Deserialize)]
 struct PoolPatch {
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct AccountImport {
+    path: Option<String>,
+    value: Option<serde_json::Value>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AccountPatch {
+    label: Option<String>,
+    enabled: Option<bool>,
+    proxy_enabled: Option<bool>,
+    priority: Option<i32>,
+    concurrency_limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SupportBundleRequest {
+    output: String,
+    #[serde(default)]
+    network: bool,
+}
+
+fn commit_accounts(context: &ControlContext, index: &AccountIndex) -> Result<u64> {
+    // The TOML index remains the recoverable, user-owned mirror. Write it
+    // before changing the canonical runtime store so an I/O error cannot make
+    // a successful control operation disappear after a restart.
+    save_index(&context.paths, index)?;
+    let revision = context.metadata_store.replace_accounts(index)?;
+    let canonical = context.metadata_store.load_accounts()?;
+    *context.accounts.write() = canonical;
+    *context.accounts_revision.write() = revision;
+    Ok(revision)
 }
 
 async fn collect_json<T: for<'de> Deserialize<'de>>(request: Request<Incoming>) -> Result<T> {
@@ -754,6 +1191,9 @@ fn record_control_event(
     account_id: Option<Uuid>,
     detail: &str,
 ) {
+    let _ = context
+        .metadata_store
+        .record_account_event(account_id, kind, detail);
     let _ = context
         .metadata_store
         .record_event(&crate::storage::RuntimeEvent {
@@ -949,6 +1389,7 @@ mod tests {
             paths: paths.clone(),
             shutdown: shutdown.clone(),
             metadata_store,
+            accounts_revision: Arc::new(RwLock::new(0)),
         })
         .await
         .unwrap();
@@ -992,6 +1433,84 @@ mod tests {
                 "leaked field {forbidden}"
             );
         }
+        let accounts_url = format!("http://{}/v1/accounts", descriptor.address);
+        let import: serde_json::Value = client
+            .post(format!("{accounts_url}/import"))
+            .bearer_auth(&descriptor.bearer_token)
+            .json(&json!({
+                "name": "control-api-oauth",
+                "value": {"tokens": {"access_token": "opaque-test-token", "account_id": "acct-control-api"}}
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(import["accounts_revision"].as_u64().unwrap() > 0);
+        let accounts: serde_json::Value = client
+            .get(&accounts_url)
+            .bearer_auth(&descriptor.bearer_token)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = accounts["accounts"][0]["id"].as_str().unwrap().to_owned();
+        assert_eq!(accounts["accounts"][0]["label"], "control-api-oauth");
+        let patched: serde_json::Value = client
+            .patch(format!("{accounts_url}/{id}"))
+            .bearer_auth(&descriptor.bearer_token)
+            .json(&json!({"enabled": false, "priority": 7, "concurrency_limit": 2}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            patched["accounts_revision"].as_u64().unwrap()
+                > import["accounts_revision"].as_u64().unwrap()
+        );
+        let accounts: serde_json::Value = client
+            .get(&accounts_url)
+            .bearer_auth(&descriptor.bearer_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(accounts["accounts"][0]["enabled"], false);
+        assert_eq!(accounts["accounts"][0]["priority"], 7);
+        assert_eq!(accounts["accounts"][0]["concurrency_limit"], 2);
+        assert_eq!(
+            client
+                .delete(format!("{accounts_url}/{id}"))
+                .bearer_auth(&descriptor.bearer_token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        let accounts: serde_json::Value = client
+            .get(&accounts_url)
+            .bearer_auth(&descriptor.bearer_token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(accounts["accounts"].as_array().unwrap().is_empty());
         assert_eq!(
             client
                 .post(format!("http://{}/v1/proxy/start", descriptor.address))

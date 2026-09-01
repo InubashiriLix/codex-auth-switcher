@@ -4,6 +4,7 @@
 use crate::{
     error::{AppError, Result},
     i18n::LocalizedMessage,
+    types::{Account, AccountIndex, CheckStatus, Quota, StatusKind},
 };
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
@@ -51,6 +52,15 @@ pub struct RuntimeEvent {
     pub message: Option<LocalizedMessage>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccountEvent {
+    pub id: String,
+    pub account_id: Option<Uuid>,
+    pub occurred_at: DateTime<Utc>,
+    pub kind: String,
+    pub detail: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MetricBucket {
     pub started_at: DateTime<Utc>,
@@ -76,6 +86,20 @@ pub struct MetricsWindow {
     pub duration_p95_ms: Option<u64>,
     pub duration_p99_ms: Option<u64>,
     pub buckets: Vec<MetricBucket>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredCircuit {
+    pub account_id: Uuid,
+    pub reason: String,
+    pub until: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredBinding {
+    pub sticky_key: String,
+    pub account_id: Uuid,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +159,48 @@ impl MetadataStore {
                 account_id TEXT, detail TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS events_occurred_at ON runtime_events(occurred_at DESC);",
+            )
+            .map_err(db_error)?;
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS account_meta (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    revision INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT OR IGNORE INTO account_meta(singleton, revision) VALUES (1, 0);
+                 CREATE TABLE IF NOT EXISTS accounts (
+                    id TEXT PRIMARY KEY, label TEXT NOT NULL, source TEXT NOT NULL,
+                    imported_at TEXT NOT NULL, email TEXT, plan TEXT, upstream_account_id TEXT,
+                    tenant_id TEXT NOT NULL, proxy_enabled INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1, priority INTEGER NOT NULL DEFAULT 100,
+                    concurrency_limit INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS accounts_upstream_id
+                    ON accounts(upstream_account_id) WHERE upstream_account_id IS NOT NULL;
+                 CREATE TABLE IF NOT EXISTS quota_windows (
+                    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    kind TEXT NOT NULL, used_percent REAL NOT NULL,
+                    window_minutes INTEGER, resets_at INTEGER,
+                    PRIMARY KEY(account_id, kind)
+                 );
+                 CREATE TABLE IF NOT EXISTS account_runtime (
+                    account_id TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL, checked_at TEXT, detail TEXT NOT NULL,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    circuit_reason TEXT, circuit_until TEXT,
+                    last_success_at TEXT, last_failure_at TEXT, last_refresh_at TEXT
+                 );
+                 CREATE TABLE IF NOT EXISTS session_bindings (
+                    sticky_key TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    updated_at TEXT NOT NULL, expires_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS bindings_expires_at ON session_bindings(expires_at);
+                 CREATE TABLE IF NOT EXISTS account_events (
+                    id TEXT PRIMARY KEY, account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
+                    occurred_at TEXT NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS account_events_time ON account_events(occurred_at DESC);",
             )
             .map_err(db_error)?;
         ensure_column(
@@ -205,6 +271,29 @@ impl MetadataStore {
         Ok(())
     }
 
+    pub fn record_account_event(
+        &self,
+        account_id: Option<Uuid>,
+        kind: &str,
+        detail: &str,
+    ) -> Result<()> {
+        self.connection
+            .lock()
+            .execute(
+                "INSERT INTO account_events(id,account_id,occurred_at,kind,detail)
+                 VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    account_id.map(|id| id.to_string()),
+                    Utc::now().to_rfc3339(),
+                    kind,
+                    sanitize(detail),
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
     pub fn cleanup(&self) -> Result<()> {
         let cutoff = (Utc::now() - Duration::days(self.retention.days)).to_rfc3339();
         let connection = self.connection.lock();
@@ -228,6 +317,18 @@ impl MetadataStore {
             "DELETE FROM runtime_events WHERE id IN (SELECT id FROM runtime_events ORDER BY occurred_at DESC LIMIT -1 OFFSET ?1)",
             [self.retention.max_events as i64],
         ).map_err(db_error)?;
+        connection
+            .execute(
+                "DELETE FROM account_events WHERE occurred_at < ?1",
+                [&cutoff],
+            )
+            .map_err(db_error)?;
+        connection
+            .execute(
+                "DELETE FROM account_events WHERE id IN (SELECT id FROM account_events ORDER BY occurred_at DESC LIMIT -1 OFFSET ?1)",
+                [self.retention.max_events as i64],
+            )
+            .map_err(db_error)?;
         Ok(())
     }
 
@@ -242,6 +343,274 @@ impl MetadataStore {
             .query_row("SELECT COUNT(*) FROM runtime_events", [], |row| row.get(0))
             .map_err(db_error)?;
         Ok((requests, events))
+    }
+
+    /// Import the legacy TOML index once, then treat SQLite as the canonical
+    /// account metadata store. Missing legacy rows are added so interrupted
+    /// migrations remain recoverable and idempotent.
+    pub fn reconcile_accounts(&self, legacy: &AccountIndex) -> Result<(AccountIndex, u64)> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(db_error)?;
+        for account in &legacy.accounts {
+            insert_account_if_missing(&transaction, account)?;
+        }
+        if !legacy.accounts.is_empty() {
+            transaction
+                .execute(
+                    "UPDATE account_meta SET revision = MAX(revision, 1) WHERE singleton = 1",
+                    [],
+                )
+                .map_err(db_error)?;
+        }
+        transaction.commit().map_err(db_error)?;
+        drop(connection);
+        Ok((self.load_accounts()?, self.accounts_revision()?))
+    }
+
+    pub fn replace_accounts(&self, index: &AccountIndex) -> Result<u64> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction().map_err(db_error)?;
+        for account in &index.accounts {
+            upsert_account(&transaction, account)?;
+        }
+        let retained = index
+            .accounts
+            .iter()
+            .map(|account| account.id.to_string())
+            .collect::<Vec<_>>();
+        {
+            let mut statement = transaction
+                .prepare("SELECT id FROM accounts")
+                .map_err(db_error)?;
+            let existing = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(db_error)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_error)?;
+            for id in existing {
+                if !retained.iter().any(|candidate| candidate == &id) {
+                    transaction
+                        .execute("DELETE FROM accounts WHERE id = ?1", [&id])
+                        .map_err(db_error)?;
+                }
+            }
+        }
+        transaction
+            .execute(
+                "UPDATE account_meta SET revision = revision + 1 WHERE singleton = 1",
+                [],
+            )
+            .map_err(db_error)?;
+        let revision = transaction
+            .query_row(
+                "SELECT revision FROM account_meta WHERE singleton = 1",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)?;
+        Ok(revision)
+    }
+
+    pub fn load_accounts(&self) -> Result<AccountIndex> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT a.id,a.label,a.source,a.imported_at,a.email,a.plan,a.upstream_account_id,
+                        a.tenant_id,a.proxy_enabled,a.enabled,a.priority,a.concurrency_limit,a.revision,
+                        r.status,r.checked_at,r.detail
+                 FROM accounts a LEFT JOIN account_runtime r ON r.account_id = a.id
+                 ORDER BY a.priority ASC, a.imported_at ASC, a.id ASC",
+            )
+            .map_err(db_error)?;
+        let mut accounts = statement
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let imported_at: String = row.get(3)?;
+                let status: Option<String> = row.get(13)?;
+                let checked_at: Option<String> = row.get(14)?;
+                Ok(Account {
+                    id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+                    label: row.get(1)?,
+                    source: row.get(2)?,
+                    imported_at: parse_time(&imported_at),
+                    email: row.get(4)?,
+                    plan: row.get(5)?,
+                    account_id: row.get(6)?,
+                    tenant_id: row.get(7)?,
+                    proxy_enabled: row.get(8)?,
+                    enabled: row.get(9)?,
+                    priority: row.get(10)?,
+                    concurrency_limit: row.get(11)?,
+                    revision: row.get(12)?,
+                    status: CheckStatus {
+                        kind: status
+                            .as_deref()
+                            .map(status_kind)
+                            .unwrap_or(StatusKind::Unknown),
+                        checked_at: checked_at.as_deref().map(parse_time),
+                        detail: row
+                            .get::<_, Option<String>>(15)?
+                            .unwrap_or_else(|| "尚未检测".into()),
+                        primary: None,
+                        secondary: None,
+                    },
+                })
+            })
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?;
+        let mut quota_statement = connection
+            .prepare(
+                "SELECT kind,used_percent,window_minutes,resets_at FROM quota_windows WHERE account_id = ?1",
+            )
+            .map_err(db_error)?;
+        for account in &mut accounts {
+            let rows = quota_statement
+                .query_map([account.id.to_string()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        Quota {
+                            used_percent: row.get(1)?,
+                            window_minutes: row.get(2)?,
+                            resets_at: row.get(3)?,
+                        },
+                    ))
+                })
+                .map_err(db_error)?;
+            for row in rows {
+                let (kind, quota) = row.map_err(db_error)?;
+                if kind == "primary" {
+                    account.status.primary = Some(quota);
+                } else if kind == "secondary" {
+                    account.status.secondary = Some(quota);
+                }
+            }
+        }
+        Ok(AccountIndex { accounts })
+    }
+
+    pub fn accounts_revision(&self) -> Result<u64> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT revision FROM account_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)
+    }
+
+    pub fn save_circuit(
+        &self,
+        account_id: Uuid,
+        reason: &str,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        self.connection
+            .lock()
+            .execute(
+                "UPDATE account_runtime SET circuit_reason=?2,circuit_until=?3,
+                    failure_count=failure_count+1,last_failure_at=?4 WHERE account_id=?1",
+                params![
+                    account_id.to_string(),
+                    reason,
+                    until.map(|time| time.to_rfc3339()),
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn clear_circuit(&self, account_id: Uuid) -> Result<()> {
+        self.connection
+            .lock()
+            .execute(
+                "UPDATE account_runtime SET circuit_reason=NULL,circuit_until=NULL,
+                    failure_count=0,last_success_at=?2 WHERE account_id=?1",
+                params![account_id.to_string(), Utc::now().to_rfc3339()],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn load_circuits(&self) -> Result<Vec<StoredCircuit>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT account_id,circuit_reason,circuit_until FROM account_runtime
+                 WHERE circuit_reason IS NOT NULL",
+            )
+            .map_err(db_error)?;
+        statement
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let until: Option<String> = row.get(2)?;
+                Ok(StoredCircuit {
+                    account_id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+                    reason: row.get(1)?,
+                    until: until.as_deref().map(parse_time),
+                })
+            })
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)
+    }
+
+    pub fn save_binding(&self, sticky_key: &str, account_id: Uuid, ttl: Duration) -> Result<()> {
+        let now = Utc::now();
+        self.connection
+            .lock()
+            .execute(
+                "INSERT INTO session_bindings(sticky_key,account_id,updated_at,expires_at)
+                 VALUES (?1,?2,?3,?4) ON CONFLICT(sticky_key) DO UPDATE SET
+                 account_id=excluded.account_id,updated_at=excluded.updated_at,expires_at=excluded.expires_at",
+                params![sticky_key, account_id.to_string(), now.to_rfc3339(), (now + ttl).to_rfc3339()],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn delete_binding(&self, sticky_key: &str) -> Result<()> {
+        self.connection
+            .lock()
+            .execute(
+                "DELETE FROM session_bindings WHERE sticky_key=?1",
+                [sticky_key],
+            )
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    pub fn load_bindings(&self) -> Result<Vec<StoredBinding>> {
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection.lock();
+        connection
+            .execute(
+                "DELETE FROM session_bindings WHERE expires_at <= ?1",
+                [&now],
+            )
+            .map_err(db_error)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT sticky_key,account_id,expires_at FROM session_bindings
+                 WHERE sticky_key LIKE 'session:%' ORDER BY updated_at DESC",
+            )
+            .map_err(db_error)?;
+        statement
+            .query_map([], |row| {
+                let id: String = row.get(1)?;
+                let expires: String = row.get(2)?;
+                Ok(StoredBinding {
+                    sticky_key: row.get(0)?,
+                    account_id: Uuid::parse_str(&id).unwrap_or_else(|_| Uuid::nil()),
+                    expires_at: parse_time(&expires),
+                })
+            })
+            .map_err(db_error)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)
     }
 
     pub fn recent_events(&self, limit: usize, offset: usize) -> Result<Vec<RuntimeEvent>> {
@@ -271,6 +640,41 @@ impl MetadataStore {
             .map_err(db_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(db_error)
+    }
+
+    pub fn recent_account_events(
+        &self,
+        account_id: Option<Uuid>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<AccountEvent>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT id,account_id,occurred_at,kind,detail FROM account_events ORDER BY occurred_at DESC LIMIT ?1 OFFSET ?2",
+            )
+            .map_err(db_error)?;
+        let rows = statement
+            .query_map(params![limit.min(500) as i64, offset as i64], |row| {
+                let occurred: String = row.get(2)?;
+                let account: Option<String> = row.get(1)?;
+                Ok(AccountEvent {
+                    id: row.get(0)?,
+                    account_id: account.and_then(|id| Uuid::parse_str(&id).ok()),
+                    occurred_at: DateTime::parse_from_rfc3339(&occurred)
+                        .map(|time| time.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                    kind: row.get(3)?,
+                    detail: row.get(4)?,
+                })
+            })
+            .map_err(db_error)?;
+        Ok(rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_error)?
+            .into_iter()
+            .filter(|event| account_id.is_none_or(|id| event.account_id == Some(id)))
+            .collect())
     }
 
     pub fn recent_requests(
@@ -442,6 +846,128 @@ fn request_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestSummary>
     })
 }
 
+fn insert_account_if_missing(
+    transaction: &rusqlite::Transaction<'_>,
+    account: &Account,
+) -> Result<()> {
+    let exists = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=?1)",
+            [account.id.to_string()],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(db_error)?;
+    if !exists {
+        upsert_account(transaction, account)?;
+    }
+    Ok(())
+}
+
+fn upsert_account(transaction: &rusqlite::Transaction<'_>, account: &Account) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO accounts
+             (id,label,source,imported_at,email,plan,upstream_account_id,tenant_id,proxy_enabled,
+              enabled,priority,concurrency_limit,revision)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             ON CONFLICT(id) DO UPDATE SET label=excluded.label,source=excluded.source,
+              imported_at=excluded.imported_at,email=excluded.email,plan=excluded.plan,
+              upstream_account_id=excluded.upstream_account_id,tenant_id=excluded.tenant_id,
+              proxy_enabled=excluded.proxy_enabled,enabled=excluded.enabled,priority=excluded.priority,
+              concurrency_limit=excluded.concurrency_limit,revision=excluded.revision",
+            params![
+                account.id.to_string(),
+                account.label,
+                account.source,
+                account.imported_at.to_rfc3339(),
+                account.email,
+                account.plan,
+                account.account_id,
+                account.tenant_id,
+                account.proxy_enabled,
+                account.enabled,
+                account.priority,
+                account.concurrency_limit,
+                account.revision,
+            ],
+        )
+        .map_err(db_error)?;
+    transaction
+        .execute(
+            "INSERT INTO account_runtime(account_id,status,checked_at,detail)
+             VALUES (?1,?2,?3,?4) ON CONFLICT(account_id) DO UPDATE SET
+             status=excluded.status,checked_at=excluded.checked_at,detail=excluded.detail",
+            params![
+                account.id.to_string(),
+                status_kind_name(&account.status.kind),
+                account.status.checked_at.map(|time| time.to_rfc3339()),
+                sanitize(&account.status.detail),
+            ],
+        )
+        .map_err(db_error)?;
+    transaction
+        .execute(
+            "DELETE FROM quota_windows WHERE account_id=?1",
+            [account.id.to_string()],
+        )
+        .map_err(db_error)?;
+    for (kind, quota) in [
+        ("primary", account.status.primary.as_ref()),
+        ("secondary", account.status.secondary.as_ref()),
+    ] {
+        if let Some(quota) = quota {
+            transaction
+                .execute(
+                    "INSERT INTO quota_windows(account_id,kind,used_percent,window_minutes,resets_at)
+                     VALUES (?1,?2,?3,?4,?5)",
+                    params![
+                        account.id.to_string(),
+                        kind,
+                        quota.used_percent,
+                        quota.window_minutes,
+                        quota.resets_at,
+                    ],
+                )
+                .map_err(db_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn status_kind_name(kind: &StatusKind) -> &'static str {
+    match kind {
+        StatusKind::Live => "healthy",
+        StatusKind::Exhausted => "quota_exhausted",
+        StatusKind::Reauth => "reauth_required",
+        StatusKind::AccessDenied => "access_denied",
+        StatusKind::RateLimited => "rate_limited",
+        StatusKind::TemporaryFailure => "temporary_failure",
+        StatusKind::Disabled => "disabled",
+        StatusKind::Invalid => "invalid",
+        StatusKind::Unknown => "unknown",
+    }
+}
+
+fn status_kind(value: &str) -> StatusKind {
+    match value {
+        "healthy" => StatusKind::Live,
+        "quota_exhausted" => StatusKind::Exhausted,
+        "reauth_required" => StatusKind::Reauth,
+        "access_denied" => StatusKind::AccessDenied,
+        "rate_limited" => StatusKind::RateLimited,
+        "temporary_failure" => StatusKind::TemporaryFailure,
+        "disabled" => StatusKind::Disabled,
+        "invalid" => StatusKind::Invalid,
+        _ => StatusKind::Unknown,
+    }
+}
+
+fn parse_time(value: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|time| time.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
 fn ensure_column(connection: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
     let mut statement = connection
         .prepare(&format!("PRAGMA table_info({table})"))
@@ -504,6 +1030,35 @@ fn db_error(error: rusqlite::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn account(id: Uuid) -> Account {
+        Account {
+            id,
+            label: "account".into(),
+            source: "test".into(),
+            imported_at: Utc::now(),
+            email: Some("account@example.test".into()),
+            plan: Some("team".into()),
+            account_id: Some("upstream-account".into()),
+            status: CheckStatus {
+                kind: StatusKind::Live,
+                checked_at: Some(Utc::now()),
+                detail: "healthy".into(),
+                primary: Some(Quota {
+                    used_percent: 20.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(Utc::now().timestamp() + 300),
+                }),
+                secondary: None,
+            },
+            tenant_id: "local".into(),
+            proxy_enabled: true,
+            enabled: true,
+            priority: 20,
+            concurrency_limit: 2,
+            revision: 7,
+        }
+    }
 
     #[test]
     fn storage_never_keeps_secret_bearing_event_detail() {
@@ -634,5 +1189,42 @@ mod tests {
             events[0].message.as_ref().unwrap().key,
             "event-daemon-started"
         );
+    }
+
+    #[test]
+    fn account_migration_round_trips_runtime_and_revision() {
+        let path = std::env::temp_dir().join(format!(
+            "codex-switcher-accounts-store-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let store = MetadataStore::open(&path, RetentionPolicy::default()).unwrap();
+        let id = Uuid::new_v4();
+        let legacy = AccountIndex {
+            accounts: vec![account(id)],
+        };
+        let (loaded, initial_revision) = store.reconcile_accounts(&legacy).unwrap();
+        assert_eq!(initial_revision, 1);
+        assert_eq!(loaded.accounts[0].priority, 20);
+        assert_eq!(loaded.accounts[0].concurrency_limit, 2);
+        assert_eq!(
+            loaded.accounts[0]
+                .status
+                .primary
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            20.0
+        );
+
+        let revision = store.replace_accounts(&loaded).unwrap();
+        assert_eq!(revision, 2);
+        store
+            .save_circuit(id, "rate_limited", Some(Utc::now() + Duration::minutes(5)))
+            .unwrap();
+        store
+            .save_binding("session:test", id, Duration::hours(1))
+            .unwrap();
+        assert_eq!(store.load_circuits().unwrap()[0].account_id, id);
+        assert_eq!(store.load_bindings().unwrap()[0].account_id, id);
     }
 }

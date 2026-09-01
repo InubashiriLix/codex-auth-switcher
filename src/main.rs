@@ -2,15 +2,17 @@
 use clap::Parser;
 use codex_switcher::{
     Paths,
-    account::load_index,
-    cli::{Cli, Commands, ServiceSubcommand},
+    account::{load_index, save_index, update_from_current},
+    cli::{AccountSubcommand, Cli, Commands, ServiceSubcommand},
     config::{Config, load_config},
     daemon::{
         check_daemon_status, control_request, run_daemon, send_reload_signal, send_stop_signal,
     },
+    diagnostics,
     error::Result,
     i18n::{Language, LanguagePreference, translate},
     paths::paths,
+    storage::{MetadataStore, RetentionPolicy},
     types::AccountIndex,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -200,6 +202,83 @@ fn handle_daemon_command_sync(command: &Commands, paths: &Paths, language: Langu
         ))
     };
     match command {
+        Commands::Status { json } => {
+            let snapshot = tokio::runtime::Runtime::new()?.block_on(control_request(
+                paths,
+                hyper::Method::GET,
+                "/v1/snapshot",
+            ))?;
+            print_output(snapshot, *json)
+        }
+        Commands::Doctor { network, json } => {
+            let endpoint = if *network {
+                "/v1/doctor?network=true"
+            } else {
+                "/v1/doctor"
+            };
+            let report = control_sync(paths, hyper::Method::GET, endpoint).unwrap_or_else(|_| {
+                let config = load_config(paths).unwrap_or_else(|_| Config::defaults());
+                let index = load_index(paths).unwrap_or_default();
+                serde_json::to_value(diagnostics::doctor(&config, paths, &index, *network))
+                    .unwrap_or_else(|_| serde_json::json!({"error":"doctor serialization failed"}))
+            });
+            print_output(report, *json)
+        }
+        Commands::SupportBundle {
+            output,
+            network,
+            json,
+        } => {
+            let config = load_config(paths)?;
+            let index = load_index(paths)?;
+            let store = MetadataStore::open(
+                &paths.database_file,
+                RetentionPolicy {
+                    days: config.retention.days,
+                    max_requests: config.retention.max_requests,
+                    max_events: config.retention.max_events,
+                },
+            )
+            .ok();
+            let report = diagnostics::write_support_bundle(
+                output,
+                &config,
+                paths,
+                &index,
+                store.as_ref(),
+                *network,
+            )?;
+            print_output(
+                serde_json::json!({"ok":true,"output":output,"report":report}),
+                *json,
+            )
+        }
+        Commands::Account(account) => match &account.command {
+            AccountSubcommand::UpdateCurrent { account_id, json } => {
+                let endpoint = format!("/v1/accounts/{account_id}/update-current");
+                let remote = control_sync(paths, hyper::Method::POST, &endpoint);
+                let value = match remote {
+                    Ok(value) => value,
+                    Err(_) => {
+                        let config = load_config(paths)?;
+                        let mut index = load_index(paths)?;
+                        update_from_current(&config, &mut index, *account_id)?;
+                        save_index(paths, &index)?;
+                        serde_json::json!({"ok":true,"mode":"local"})
+                    }
+                };
+                print_output(value, *json)
+            }
+            AccountSubcommand::Events { account_id, json } => {
+                let endpoint = format!("/v1/accounts/{account_id}/events");
+                let value = tokio::runtime::Runtime::new()?.block_on(control_request(
+                    paths,
+                    hyper::Method::GET,
+                    &endpoint,
+                ))?;
+                print_output(value, *json)
+            }
+        },
         Commands::DaemonStatus => {
             match tokio::runtime::Runtime::new()?.block_on(control_request(
                 paths,
@@ -237,6 +316,19 @@ fn handle_daemon_command_sync(command: &Commands, paths: &Paths, language: Langu
         }
         Commands::Service(_) => unreachable!("service commands are handled before daemon commands"),
     }
+}
+
+fn control_sync(paths: &Paths, method: hyper::Method, endpoint: &str) -> Result<serde_json::Value> {
+    tokio::runtime::Runtime::new()?.block_on(control_request(paths, method, endpoint))
+}
+
+fn print_output(value: serde_json::Value, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(&value)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    }
+    Ok(())
 }
 
 fn handle_service_command(command: &ServiceSubcommand) -> Result<()> {

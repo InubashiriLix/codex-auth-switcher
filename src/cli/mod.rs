@@ -28,6 +28,30 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Show a credential-free runtime snapshot
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnose local Codex Switcher health
+    Doctor {
+        /// Perform an explicit minimal network/TLS preflight
+        #[arg(long)]
+        network: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export a credential-free diagnostic tar.gz bundle
+    SupportBundle {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        network: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage existing account snapshots without exposing credentials
+    Account(AccountArgs),
     /// Check daemon status
     DaemonStatus,
     /// Stop daemon gracefully
@@ -36,6 +60,28 @@ pub enum Commands {
     DaemonReload,
     /// Manage the native Windows Service
     Service(ServiceArgs),
+}
+
+#[derive(Args)]
+pub struct AccountArgs {
+    #[command(subcommand)]
+    pub command: AccountSubcommand,
+}
+
+#[derive(Subcommand)]
+pub enum AccountSubcommand {
+    /// Replace an account snapshot with the current official Codex login
+    UpdateCurrent {
+        account_id: uuid::Uuid,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the account's credential-free fault timeline
+    Events {
+        account_id: uuid::Uuid,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args)]

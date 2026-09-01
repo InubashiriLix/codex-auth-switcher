@@ -23,7 +23,9 @@ impl Recommender {
     pub fn recommend(&self, accounts: &[Account], threshold: f64) -> Option<Uuid> {
         let eligible: Vec<Account> = accounts
             .iter()
-            .filter(|account| account.proxy_enabled && account.status.kind == StatusKind::Live)
+            .filter(|account| {
+                account.enabled && account.proxy_enabled && account.status.kind == StatusKind::Live
+            })
             .filter(|account| {
                 [
                     account.status.primary.as_ref(),
@@ -154,6 +156,10 @@ mod tests {
             account_id: None,
             tenant_id: "local".into(),
             proxy_enabled: true,
+            enabled: true,
+            priority: 100,
+            concurrency_limit: 0,
+            revision: 1,
             status: CheckStatus {
                 kind: StatusKind::Live,
                 checked_at: Some(Utc::now()),

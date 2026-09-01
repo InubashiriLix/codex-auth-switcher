@@ -140,6 +140,10 @@ pub struct ProxyConfig {
     pub strategy: RecommendStrategy,
     #[serde(default = "default_target_base")]
     pub target_base: String,
+    #[serde(default)]
+    pub device_identity: DeviceIdentityConfig,
+    #[serde(default)]
+    pub auth_policy: AuthPolicyConfig,
 }
 
 impl Default for ProxyConfig {
@@ -152,6 +156,66 @@ impl Default for ProxyConfig {
             cooldown_seconds: default_cooldown(),
             strategy: RecommendStrategy::default(),
             target_base: default_target_base(),
+            device_identity: DeviceIdentityConfig::default(),
+            auth_policy: AuthPolicyConfig::default(),
+        }
+    }
+}
+
+/// Conservative authentication handling for the local proxy. Authentication
+/// failures are never replayed through another account.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuthPolicyConfig {
+    #[serde(default = "default_refresh_before_expiry_seconds")]
+    pub refresh_before_expiry_seconds: u64,
+    #[serde(default = "default_true")]
+    pub refresh_once_on_401: bool,
+    #[serde(default)]
+    pub cross_account_replay: bool,
+    #[serde(default = "default_rate_limit_fallback_seconds")]
+    pub rate_limit_fallback_seconds: u64,
+}
+
+impl Default for AuthPolicyConfig {
+    fn default() -> Self {
+        Self {
+            refresh_before_expiry_seconds: default_refresh_before_expiry_seconds(),
+            refresh_once_on_401: true,
+            cross_account_replay: false,
+            rate_limit_fallback_seconds: default_rate_limit_fallback_seconds(),
+        }
+    }
+}
+
+/// Stable upstream client identity used by every account routed through this
+/// proxy. Session and thread identifiers are deliberately not part of it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeviceIdentityConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub installation_id: Option<Uuid>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    #[serde(default)]
+    pub originator: Option<String>,
+}
+
+fn default_refresh_before_expiry_seconds() -> u64 {
+    300
+}
+
+fn default_rate_limit_fallback_seconds() -> u64 {
+    900
+}
+
+impl Default for DeviceIdentityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            installation_id: None,
+            user_agent: None,
+            originator: None,
         }
     }
 }
@@ -190,6 +254,26 @@ pub fn load_config(p: &Paths) -> Result<Config> {
     let mut config: Config = toml::from_str(&raw)?;
     if let Some(reason) = codex_home_repair_reason(&config.codex_home)? {
         config = repair_invalid_codex_home(p, &raw, config, &reason)?;
+    }
+    let mut policy_notices = Vec::new();
+    if config.proxy.auth_policy.cross_account_replay {
+        config.proxy.auth_policy.cross_account_replay = false;
+        policy_notices.push("为避免认证故障扩散，cross_account_replay 已强制关闭");
+    }
+    if config.proxy.auto_switch {
+        policy_notices.push("auto_switch 仅为新会话选择健康账户；不会重放认证失败请求");
+    }
+    if config.proxy.device_identity.user_agent.is_some()
+        || config.proxy.device_identity.originator.is_some()
+    {
+        policy_notices.push("user_agent/originator 身份覆盖已弃用并会被忽略");
+    }
+    if !policy_notices.is_empty() {
+        let notice = policy_notices.join("；");
+        config.startup_notice = Some(match config.startup_notice.take() {
+            Some(existing) => format!("{existing}；{notice}"),
+            None => notice,
+        });
     }
     Ok(config)
 }
@@ -424,5 +508,24 @@ mod tests {
             load_config(&paths).unwrap().language,
             LanguagePreference::Fr
         );
+    }
+
+    #[test]
+    fn unsafe_replay_setting_is_disabled_with_a_startup_notice() {
+        let paths = test_paths();
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        let raw = format!(
+            "codex_home = {:?}\naccounts_dir = {:?}\n[proxy]\nauto_switch = true\n[proxy.auth_policy]\ncross_account_replay = true\n[proxy.device_identity]\nuser_agent = \"legacy-agent\"\n",
+            paths.config_dir.join("codex").display().to_string(),
+            paths.config_dir.join("accounts").display().to_string(),
+        );
+        fs::write(&paths.config_file, raw).unwrap();
+
+        let loaded = load_config(&paths).unwrap();
+        assert!(!loaded.proxy.auth_policy.cross_account_replay);
+        let notice = loaded.startup_notice.unwrap();
+        assert!(notice.contains("cross_account_replay"));
+        assert!(notice.contains("auto_switch"));
+        assert!(notice.contains("user_agent/originator"));
     }
 }
