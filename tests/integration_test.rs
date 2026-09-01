@@ -17,6 +17,10 @@ fn create_test_account(label: &str, used_percent: f64, status_kind: StatusKind) 
         account_id: None,
         tenant_id: "local".into(),
         proxy_enabled: true,
+        enabled: true,
+        priority: 100,
+        concurrency_limit: 0,
+        revision: 1,
         status: CheckStatus {
             kind: status_kind,
             detail: "test".to_string(),
@@ -104,6 +108,7 @@ fn test_config_default_values() {
     assert_eq!(config.threshold, 85.0);
     assert_eq!(config.cooldown_seconds, 5);
     assert_eq!(config.strategy, RecommendStrategy::Smart);
+    assert!(config.device_identity.enabled);
 }
 
 #[test]
@@ -116,6 +121,8 @@ fn test_config_serialization() {
         cooldown_seconds: 10,
         strategy: RecommendStrategy::MaxRemaining,
         target_base: "https://example.com".to_string(),
+        device_identity: Default::default(),
+        auth_policy: Default::default(),
     };
 
     let toml_str = toml::to_string(&config).unwrap();

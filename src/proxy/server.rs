@@ -1,6 +1,8 @@
 use super::{
     CircuitReason, RefreshOutcome, Router, SharedProxyStats, TokenRefresher,
     connection_tracker::{ConnectionTracker, RequestGuard, RequestMetadata},
+    fingerprint::DeviceFingerprint,
+    upstream_error::{UpstreamFailure, UpstreamFailureKind, classify},
 };
 use crate::{
     account::{auth_tokens, snapshot_path},
@@ -41,6 +43,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 const MAX_REPLAY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: u64 = 1024 * 1024;
 type BoxError = Box<dyn Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 
@@ -60,12 +63,58 @@ struct ReplayCapture {
 
 struct StreamCompletion {
     guard: Option<RequestGuard>,
+    lease: Option<AccountLease>,
     store: Option<Arc<MetadataStore>>,
     summary: Option<RequestSummary>,
     response_bytes: u64,
     completed: bool,
     failed: bool,
     started: Instant,
+}
+
+struct AccountLease {
+    router: Router,
+    account_id: Option<Uuid>,
+}
+
+impl AccountLease {
+    fn new(router: Router, account_id: Uuid) -> Self {
+        router.acquire(account_id);
+        Self {
+            router,
+            account_id: Some(account_id),
+        }
+    }
+}
+
+enum InspectedUpstream {
+    Streaming {
+        response: reqwest::Response,
+        failure: Option<UpstreamFailure>,
+    },
+    Buffered {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+        failure: UpstreamFailure,
+    },
+}
+
+impl InspectedUpstream {
+    fn failure(&self) -> Option<&UpstreamFailure> {
+        match self {
+            Self::Streaming { failure, .. } => failure.as_ref(),
+            Self::Buffered { failure, .. } => Some(failure),
+        }
+    }
+}
+
+impl Drop for AccountLease {
+    fn drop(&mut self) {
+        if let Some(account_id) = self.account_id.take() {
+            self.router.release(account_id);
+        }
+    }
 }
 
 impl StreamCompletion {
@@ -78,6 +127,7 @@ impl StreamCompletion {
 impl Drop for StreamCompletion {
     fn drop(&mut self) {
         self.guard.take();
+        self.lease.take();
         if let (Some(store), Some(mut summary)) = (&self.store, self.summary.take()) {
             summary.duration_ms = Some(self.started.elapsed().as_millis() as u64);
             summary.response_bytes = self.response_bytes;
@@ -94,6 +144,15 @@ impl Drop for StreamCompletion {
 }
 
 impl ReplayCapture {
+    fn complete(bytes: &Bytes) -> Self {
+        Self {
+            bytes: bytes.to_vec(),
+            expected: Some(bytes.len() as u64),
+            seen: bytes.len() as u64,
+            overflow: false,
+        }
+    }
+
     fn push(&mut self, bytes: &Bytes) {
         self.seen += bytes.len() as u64;
         if !self.overflow && self.bytes.len() + bytes.len() <= MAX_REPLAY_BYTES {
@@ -110,6 +169,23 @@ impl ReplayCapture {
     }
 }
 
+async fn collect_request_body(mut body: Incoming) -> Result<Bytes> {
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            if bytes.len().saturating_add(data.len()) > MAX_REPLAY_BYTES {
+                return Err(AppError::Message(format!(
+                    "启用设备身份收敛时，请求体不能超过 {} MiB",
+                    MAX_REPLAY_BYTES / (1024 * 1024)
+                )));
+            }
+            bytes.extend_from_slice(data);
+        }
+    }
+    Ok(Bytes::from(bytes))
+}
+
 pub struct ProxyServer {
     config: Config,
     proxy_config: ProxyConfig,
@@ -118,6 +194,7 @@ pub struct ProxyServer {
     router: Router,
     refresher: TokenRefresher,
     client: reqwest::Client,
+    device_fingerprint: Option<DeviceFingerprint>,
     connection_tracker: ConnectionTracker,
     stats: SharedProxyStats,
     accepting: Arc<AtomicBool>,
@@ -139,6 +216,10 @@ impl ProxyServer {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("static reqwest client configuration"),
+            device_fingerprint: DeviceFingerprint::from_config(
+                &proxy_config.device_identity,
+                &config.codex_home,
+            ),
             config,
             proxy_config,
             accounts,
@@ -198,6 +279,7 @@ impl ProxyServer {
         let Some(store) = self.metadata_store.read().clone() else {
             return;
         };
+        let _ = store.record_account_event(account_id, kind, detail);
         let _ = store.record_event(&crate::storage::RuntimeEvent {
             id: Uuid::new_v4().to_string(),
             occurred_at: Utc::now(),
@@ -266,25 +348,36 @@ impl ProxyServer {
         let sticky_key = identity.sticky_key();
         let (parts, incoming) = request.into_parts();
         let target_url = target_url(&self.proxy_config.target_base, &parts.uri)?;
-        let request_headers = filtered_headers(&parts.headers);
+        let mut request_headers = filtered_headers(&parts.headers);
         let expected = parts
             .headers
             .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
-        let capture = Arc::new(Mutex::new(ReplayCapture {
-            expected,
-            ..Default::default()
-        }));
-        let capture_for_stream = capture.clone();
-        let request_stream = incoming.into_data_stream().map(move |result| {
-            if let Ok(bytes) = &result {
-                capture_for_stream.lock().push(bytes);
-            }
-            result
-        });
+        let (capture, initial_body) = if let Some(fingerprint) = &self.device_fingerprint {
+            fingerprint.normalize_headers(&mut request_headers)?;
+            let raw = collect_request_body(incoming).await?;
+            let normalized = fingerprint.normalize_body(&request_headers, raw)?;
+            (
+                Arc::new(Mutex::new(ReplayCapture::complete(&normalized))),
+                reqwest::Body::from(normalized),
+            )
+        } else {
+            let capture = Arc::new(Mutex::new(ReplayCapture {
+                expected,
+                ..Default::default()
+            }));
+            let capture_for_stream = capture.clone();
+            let request_stream = incoming.into_data_stream().map(move |result| {
+                if let Ok(bytes) = &result {
+                    capture_for_stream.lock().push(bytes);
+                }
+                result
+            });
+            (capture, reqwest::Body::wrap_stream(request_stream))
+        };
 
-        let mut route = match self.router.route(&self.accounts.read(), &sticky_key) {
+        let route = match self.router.route(&self.accounts.read(), &sticky_key) {
             Ok(route) => route,
             Err(unavailable) => {
                 return Ok(responses_error(
@@ -295,10 +388,11 @@ impl ProxyServer {
                 ));
             }
         };
+        let lease = AccountLease::new(self.router.clone(), route.account_id);
         *self.current_account.write() = Some(route.account_id);
         self.stats.write().current_account = Some(route.account_id);
 
-        let (mut access_token, mut account_header) = self.credentials(route.account_id)?;
+        let (mut access_token, account_header) = self.credentials(route.account_id)?;
         if access_token.split('.').count() == 3 {
             match self.refresher.refresh(route.account_id, false).await {
                 Ok(RefreshOutcome::Refreshed) => {
@@ -307,6 +401,11 @@ impl ProxyServer {
                 Ok(RefreshOutcome::ReauthRequired) => {
                     self.router
                         .open_circuit(route.account_id, CircuitReason::Reauth, None);
+                    self.record_event(
+                        "reauth_required",
+                        Some(route.account_id),
+                        "proactive OAuth refresh rejected",
+                    );
                     return Ok(responses_error(
                         StatusCode::UNAUTHORIZED,
                         "账户需要重新登录",
@@ -320,7 +419,6 @@ impl ProxyServer {
         }
 
         let method = parts.method.clone();
-        let initial_body = reqwest::Body::wrap_stream(request_stream);
         let mut retries = 0u64;
         let mut upstream = match self
             .send_upstream(
@@ -353,36 +451,6 @@ impl ProxyServer {
             }
         };
 
-        if upstream.status().as_u16() == 401 {
-            let replay = capture.lock().replay();
-            if let Some(replay) = replay {
-                match self
-                    .refresher
-                    .refresh_rejected(route.account_id, &access_token)
-                    .await
-                {
-                    Ok(RefreshOutcome::Refreshed | RefreshOutcome::StillValid) => {
-                        access_token = self.credentials(route.account_id)?.0;
-                        upstream = self
-                            .send_upstream(
-                                &method,
-                                &target_url,
-                                &request_headers,
-                                &access_token,
-                                account_header.as_deref(),
-                                reqwest::Body::from(replay),
-                            )
-                            .await?;
-                        retries += 1;
-                    }
-                    Ok(RefreshOutcome::ReauthRequired) | Err(_) => {
-                        self.router
-                            .open_circuit(route.account_id, CircuitReason::Reauth, None);
-                    }
-                }
-            }
-        }
-
         if upstream.status().is_server_error() {
             let replay = capture.lock().replay();
             if let Some(replay) = replay {
@@ -400,30 +468,22 @@ impl ProxyServer {
             }
         }
 
-        if self.router.auto_switch_enabled()
-            && matches!(upstream.status().as_u16(), 401 | 403 | 429)
-        {
+        let mut inspected = inspect_upstream(upstream).await?;
+        let refreshable_401 = self.proxy_config.auth_policy.refresh_once_on_401
+            && inspected
+                .failure()
+                .is_some_and(|failure| failure.kind == UpstreamFailureKind::TokenExpired);
+        if refreshable_401 {
             let replay = capture.lock().replay();
             if let Some(replay) = replay {
-                let failed_id = route.account_id;
-                let reason = match upstream.status().as_u16() {
-                    401 => CircuitReason::Unauthorized,
-                    403 => CircuitReason::Forbidden,
-                    _ => CircuitReason::RateLimited,
-                };
-                let until = (reason == CircuitReason::RateLimited)
-                    .then(|| self.account_reset(failed_id))
-                    .flatten();
-                self.router.open_circuit(failed_id, reason.clone(), until);
-                let alternative_route = {
-                    let accounts = self.accounts.read();
-                    self.router.route(&accounts, &sticky_key)
-                };
-                match alternative_route {
-                    Ok(alternative) if alternative.account_id != failed_id => {
-                        route = alternative;
-                        (access_token, account_header) = self.credentials(route.account_id)?;
-                        upstream = self
+                match self
+                    .refresher
+                    .refresh_rejected(route.account_id, &access_token)
+                    .await
+                {
+                    Ok(RefreshOutcome::Refreshed | RefreshOutcome::StillValid) => {
+                        access_token = self.credentials(route.account_id)?.0;
+                        let response = self
                             .send_upstream(
                                 &method,
                                 &target_url,
@@ -433,46 +493,33 @@ impl ProxyServer {
                                 reqwest::Body::from(replay),
                             )
                             .await?;
-                        *self.current_account.write() = Some(route.account_id);
-                        self.stats.write().current_account = Some(route.account_id);
-                        self.record_event(
-                            "auto_switch",
-                            Some(route.account_id),
-                            &format!(
-                                "账户 {} 因 {:?} 被隔离，切换到 {}",
-                                failed_id, reason, route.account_id
-                            ),
-                        );
+                        inspected = inspect_upstream(response).await?;
                         retries += 1;
                     }
-                    Ok(_) => {}
-                    Err(unavailable) => {
-                        return Ok(responses_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            &unavailable.reason,
-                            unavailable.retry_after_seconds,
-                            unavailable.earliest_recovery,
-                        ));
+                    Ok(RefreshOutcome::ReauthRequired) | Err(_) => {
+                        self.router
+                            .open_circuit(route.account_id, CircuitReason::Reauth, None);
                     }
                 }
             }
         }
 
-        let status = upstream.status();
-        match status.as_u16() {
-            401 => self
-                .router
-                .open_circuit(route.account_id, CircuitReason::Unauthorized, None),
-            403 => self
-                .router
-                .open_circuit(route.account_id, CircuitReason::Forbidden, None),
-            429 => {
-                let reset = self.account_reset(route.account_id);
-                self.router
-                    .open_circuit(route.account_id, CircuitReason::RateLimited, reset);
-            }
-            _ if status.is_success() => self.router.close_circuit(route.account_id),
-            _ => {}
+        let failure = inspected.failure().cloned();
+        let status = match &inspected {
+            InspectedUpstream::Streaming { response, .. } => response.status(),
+            InspectedUpstream::Buffered { status, .. } => *status,
+        };
+        if let Some(failure) = &failure {
+            let (reason, until) = self.circuit_for_failure(route.account_id, failure);
+            self.router.open_circuit(route.account_id, reason, until);
+            let event_kind = if status == StatusCode::TOO_MANY_REQUESTS {
+                "upstream_rate_limit"
+            } else {
+                "upstream_auth_failure"
+            };
+            self.record_event(event_kind, Some(route.account_id), &failure.event_detail());
+        } else if status.is_success() {
+            self.router.close_circuit(route.account_id);
         }
         {
             let mut stats = self.stats.write();
@@ -488,74 +535,104 @@ impl ProxyServer {
             }
         }
 
-        let mut builder = Response::builder().status(status.as_u16());
-        let response_headers = filtered_headers(upstream.headers());
-        for (name, value) in &response_headers {
-            builder = builder.header(name, value);
-        }
-        let stats = self.stats.clone();
         let captured_request_bytes = capture.lock().seen;
-        let completion = StreamCompletion {
-            guard: Some(guard),
-            store: self.metadata_store.read().clone(),
-            summary: Some(RequestSummary {
-                id: request_id.into(),
-                tenant_id: identity.tenant_id.0.clone(),
-                device_id: identity.device_id.0.clone(),
-                client_instance_id: sticky_key.clone(),
-                session_key: identity.session_key.as_ref().map(|key| key.0.clone()),
-                started_at,
-                method: method.to_string(),
-                path: parts.uri.path().into(),
-                status: Some(status.as_u16()),
-                stage: "streaming".into(),
-                duration_ms: None,
-                ttfb_ms: Some(started.elapsed().as_millis() as u64),
-                request_bytes: captured_request_bytes,
-                response_bytes: 0,
-                account_id: Some(route.account_id),
-                route_reason: route.reason.clone(),
-                route_message: localized_route_message(&route.reason),
-                retries: retries as u32,
-                partial_failure: false,
-            }),
+        let summary = RequestSummary {
+            id: request_id.into(),
+            tenant_id: identity.tenant_id.0.clone(),
+            device_id: identity.device_id.0.clone(),
+            client_instance_id: sticky_key.clone(),
+            session_key: identity.session_key.as_ref().map(|key| key.0.clone()),
+            started_at,
+            method: method.to_string(),
+            path: parts.uri.path().into(),
+            status: Some(status.as_u16()),
+            stage: "streaming".into(),
+            duration_ms: None,
+            ttfb_ms: Some(started.elapsed().as_millis() as u64),
+            request_bytes: captured_request_bytes,
             response_bytes: 0,
-            completed: false,
-            failed: false,
-            started,
+            account_id: Some(route.account_id),
+            route_reason: route.reason.clone(),
+            route_message: localized_route_message(&route.reason),
+            retries: retries as u32,
+            partial_failure: false,
         };
-        let response_stream = upstream.bytes_stream();
-        let guarded = stream::unfold(
-            (response_stream, completion, stats),
-            |(mut response_stream, mut completion, stats)| async move {
-                match response_stream.next().await {
-                    Some(Ok(bytes)) => {
-                        stats.write().response_bytes += bytes.len() as u64;
-                        completion.response_bytes += bytes.len() as u64;
-                        Some((
-                            Ok::<Frame<Bytes>, BoxError>(Frame::data(bytes)),
-                            (response_stream, completion, stats),
-                        ))
-                    }
-                    Some(Err(error)) => {
-                        stats.write().partial_failures += 1;
-                        completion.failed = true;
-                        Some((
-                            Err::<Frame<Bytes>, BoxError>(Box::new(error)),
-                            (response_stream, completion, stats),
-                        ))
-                    }
-                    None => {
-                        completion.finish();
-                        None
-                    }
+
+        match inspected {
+            InspectedUpstream::Buffered {
+                status,
+                headers,
+                body,
+                ..
+            } => {
+                let mut builder = Response::builder().status(status.as_u16());
+                for (name, value) in &filtered_headers(&headers) {
+                    builder = builder.header(name, value);
                 }
-            },
-        );
-        let body = StreamBody::new(guarded).boxed_unsync();
-        builder
-            .body(body)
-            .map_err(|error| AppError::Message(format!("构建代理响应失败：{error}")))
+                self.stats.write().response_bytes += body.len() as u64;
+                if let Some(store) = self.metadata_store.read().clone() {
+                    let mut completed = summary;
+                    completed.stage = "completed".into();
+                    completed.duration_ms = Some(started.elapsed().as_millis() as u64);
+                    completed.response_bytes = body.len() as u64;
+                    let _ = store.record_request(&completed);
+                }
+                drop(guard);
+                drop(lease);
+                builder
+                    .body(full(body))
+                    .map_err(|error| AppError::Message(format!("构建代理响应失败：{error}")))
+            }
+            InspectedUpstream::Streaming { response, .. } => {
+                let mut builder = Response::builder().status(status.as_u16());
+                for (name, value) in &filtered_headers(response.headers()) {
+                    builder = builder.header(name, value);
+                }
+                let completion = StreamCompletion {
+                    guard: Some(guard),
+                    lease: Some(lease),
+                    store: self.metadata_store.read().clone(),
+                    summary: Some(summary),
+                    response_bytes: 0,
+                    completed: false,
+                    failed: false,
+                    started,
+                };
+                let response_stream = response.bytes_stream();
+                let stats = self.stats.clone();
+                let guarded = stream::unfold(
+                    (response_stream, completion, stats),
+                    |(mut response_stream, mut completion, stats)| async move {
+                        match response_stream.next().await {
+                            Some(Ok(bytes)) => {
+                                stats.write().response_bytes += bytes.len() as u64;
+                                completion.response_bytes += bytes.len() as u64;
+                                Some((
+                                    Ok::<Frame<Bytes>, BoxError>(Frame::data(bytes)),
+                                    (response_stream, completion, stats),
+                                ))
+                            }
+                            Some(Err(error)) => {
+                                stats.write().partial_failures += 1;
+                                completion.failed = true;
+                                Some((
+                                    Err::<Frame<Bytes>, BoxError>(Box::new(error)),
+                                    (response_stream, completion, stats),
+                                ))
+                            }
+                            None => {
+                                completion.finish();
+                                None
+                            }
+                        }
+                    },
+                );
+                let body = StreamBody::new(guarded).boxed_unsync();
+                builder
+                    .body(body)
+                    .map_err(|error| AppError::Message(format!("构建代理响应失败：{error}")))
+            }
+        }
     }
 
     async fn send_upstream(
@@ -615,6 +692,41 @@ impl ProxyServer {
             .and_then(|timestamp| DateTime::from_timestamp(timestamp, 0))
     }
 
+    fn circuit_for_failure(
+        &self,
+        account_id: Uuid,
+        failure: &UpstreamFailure,
+    ) -> (CircuitReason, Option<DateTime<Utc>>) {
+        match failure.kind {
+            UpstreamFailureKind::TokenExpired => (CircuitReason::Reauth, None),
+            UpstreamFailureKind::InvalidCredential => (CircuitReason::InvalidCredential, None),
+            UpstreamFailureKind::OrganizationMismatch => {
+                (CircuitReason::OrganizationMismatch, None)
+            }
+            UpstreamFailureKind::MembershipRemoved => (CircuitReason::MembershipRemoved, None),
+            UpstreamFailureKind::IpAllowlist => (CircuitReason::IpAllowlist, None),
+            UpstreamFailureKind::Forbidden => (CircuitReason::Forbidden, None),
+            UpstreamFailureKind::QuotaBlocked => (CircuitReason::QuotaBlocked, None),
+            UpstreamFailureKind::UnknownUnauthorized => (CircuitReason::Unauthorized, None),
+            UpstreamFailureKind::TemporaryRateLimit | UpstreamFailureKind::UnknownRateLimit => {
+                let until = failure
+                    .retry_after_seconds
+                    .map(|seconds| {
+                        Utc::now() + chrono::Duration::seconds(seconds.min(i64::MAX as u64) as i64)
+                    })
+                    .or_else(|| self.account_reset(account_id))
+                    .or_else(|| {
+                        let seconds = self.proxy_config.auth_policy.rate_limit_fallback_seconds;
+                        (seconds > 0).then(|| {
+                            Utc::now()
+                                + chrono::Duration::seconds(seconds.min(i64::MAX as u64) as i64)
+                        })
+                    });
+                (CircuitReason::RateLimited, until)
+            }
+        }
+    }
+
     pub async fn stop_accepting(&self) {
         self.accepting.store(false, Ordering::Relaxed);
     }
@@ -626,8 +738,41 @@ impl ProxyServer {
     }
 
     pub fn attach_metadata_store(&self, store: Arc<MetadataStore>) {
+        self.router.attach_store(store.clone());
         *self.metadata_store.write() = Some(store);
     }
+}
+
+async fn inspect_upstream(response: reqwest::Response) -> Result<InspectedUpstream> {
+    let status = response.status();
+    if !matches!(status.as_u16(), 401 | 403 | 429) {
+        return Ok(InspectedUpstream::Streaming {
+            response,
+            failure: None,
+        });
+    }
+
+    let headers = response.headers().clone();
+    let declared_length = response.content_length();
+    if declared_length.is_some_and(|length| length <= MAX_ERROR_BODY_BYTES) {
+        let body = response.bytes().await?;
+        if body.len() as u64 > MAX_ERROR_BODY_BYTES {
+            return Err(AppError::Message("上游错误响应超过 1 MiB，拒绝缓冲".into()));
+        }
+        let failure = classify(status, &headers, &body);
+        return Ok(InspectedUpstream::Buffered {
+            status,
+            headers,
+            body,
+            failure,
+        });
+    }
+
+    let failure = classify(status, &headers, &[]);
+    Ok(InspectedUpstream::Streaming {
+        response,
+        failure: Some(failure),
+    })
 }
 
 fn localized_route_message(reason: &str) -> Option<crate::i18n::LocalizedMessage> {
@@ -855,6 +1000,10 @@ mod tests {
             },
             tenant_id: "local".into(),
             proxy_enabled: true,
+            enabled: true,
+            priority: 100,
+            concurrency_limit: 0,
+            revision: 1,
         };
         let mut config = Config::defaults();
         config.accounts_dir = accounts_dir;

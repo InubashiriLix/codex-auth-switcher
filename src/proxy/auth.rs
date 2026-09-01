@@ -94,7 +94,13 @@ impl TokenRefresher {
         if rejected_access.is_some_and(|rejected| rejected != access) {
             return Ok(RefreshOutcome::StillValid);
         }
-        if !force && !expires_within(&access, 300) {
+        let refresh_window = self
+            .config
+            .proxy
+            .auth_policy
+            .refresh_before_expiry_seconds
+            .min(i64::MAX as u64) as i64;
+        if !force && !expires_within(&access, refresh_window) {
             return Ok(RefreshOutcome::StillValid);
         }
         let refresh_token = value
@@ -147,6 +153,11 @@ impl TokenRefresher {
             .pointer("/tokens/account_id")
             .cloned()
             .unwrap_or(Value::Null);
+        let credential_revision = value
+            .pointer("/_codex_switcher/credential_revision")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
         let canonical = json!({
             "auth_mode": "chatgpt",
             "OPENAI_API_KEY": null,
@@ -157,6 +168,9 @@ impl TokenRefresher {
                 "account_id": account,
             },
             "last_refresh": Utc::now().to_rfc3339(),
+            "_codex_switcher": {
+                "credential_revision": credential_revision,
+            },
         });
         atomic_write(&path, &serde_json::to_vec_pretty(&canonical)?)?;
         Ok(RefreshOutcome::Refreshed)

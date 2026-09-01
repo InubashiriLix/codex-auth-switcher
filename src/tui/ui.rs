@@ -791,6 +791,10 @@ mod tests {
                 status: CheckStatus::default(),
                 tenant_id: "local".into(),
                 proxy_enabled: true,
+                enabled: true,
+                priority: 100,
+                concurrency_limit: 0,
+                revision: 1,
             }],
         };
         let mut ui = Ui::new(config, index, None, Workspace::Accounts);

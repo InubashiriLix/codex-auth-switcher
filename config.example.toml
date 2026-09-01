@@ -39,7 +39,7 @@ enabled = false
 # 默认只监听本地，提高安全性
 listen_addr = "127.0.0.1:8765"
 
-# 是否启用自动切换（优先级高于 mode.auto_switch）
+# 是否允许新会话自动选择健康账户。认证/权限/限流失败的原请求不会切号重放。
 auto_switch = false
 
 # Token使用率阈值（百分比）
@@ -60,6 +60,20 @@ strategy = "smart"
 # ChatGPT API基础URL（生产环境保持默认；测试可使用回环地址）
 target_base = "https://chatgpt.com"
 
+# 上游设备身份一致性：复用本机 Codex installation_id；会话、线程和窗口字段保持独立。
+# installation_id 仅用于迁移同一台机器的现有身份，不能用于伪装不同用户或设备。
+[proxy.device_identity]
+enabled = true
+# installation_id = "00000000-0000-0000-0000-000000000000"
+
+# 认证故障保护：401 只允许在明确 token_expired 时由原账户刷新一次；
+# 403 和其他 401 会持久隔离。cross_account_replay 始终为 false。
+[proxy.auth_policy]
+refresh_before_expiry_seconds = 300
+refresh_once_on_401 = true
+cross_account_replay = false
+rate_limit_fallback_seconds = 900
+
 # 元数据历史保留；正文和认证信息从不写入数据库
 [retention]
 days = 7
@@ -76,7 +90,7 @@ max_events = 10000
 # threshold = 90.0          # 高阈值，最大化利用
 # strategy = "max_remaining"
 
-# === 示例2：生产环境（自动切换）===
+# === 示例2：生产环境（新会话自动路由）===
 # [mode]
 # type = "proxy_daemon"
 # auto_switch = true
@@ -85,12 +99,12 @@ max_events = 10000
 # [proxy]
 # enabled = true
 # listen_addr = "127.0.0.1:8765"
-# auto_switch = true        # 启用自动切换
+# auto_switch = true        # 仅为新会话选择健康账户，不重放认证失败请求
 # threshold = 85.0          # 保守阈值
 # cooldown_seconds = 10     # 较长冷却时间
 # strategy = "smart"
 
-# === 示例3：多账户轮询 ===
+# === 示例3：新会话轮询 ===
 # [proxy]
 # enabled = true
 # threshold = 70.0          # 较低阈值，频繁切换
@@ -112,8 +126,8 @@ max_events = 10000
 # 使用建议 / Usage Tips
 #
 # 监控频率：
-#   - 默认每30秒检查一次token使用情况
-#   - 如需修改，编辑 src/proxy/monitor.rs
+#   - 健康账户默认高频检查；活跃或接近阈值的账户会更频繁检查
+#   - 失败账户使用有上限的指数退避和随机抖动，避免持续重试
 #
 # 阈值选择：
 #   - 85%：平衡性能和稳定性（推荐）

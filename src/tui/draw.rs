@@ -123,7 +123,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, ui: &Ui, theme: super::ThemeColors
     let keys = if ui.render_mode == super::RenderMode::Ascii {
         match ui.workspace {
             Workspace::Accounts => {
-                "a Import  r/R Check  Enter Activate  / Filter  m Workspace  t Theme  ? Help".into()
+                "a Import  u Update login  r/R Check  D Doctor  b Bundle  Enter Activate  / Filter  m Workspace  t Theme  ? Help".into()
             }
             Workspace::Proxy => {
                 "Tab/1-4 Panels  j/k Select  Enter Details  s Start/stop  p Pause  t Theme  ? Help"
@@ -1242,6 +1242,25 @@ fn draw_detail(
                             }
                         )),
                         Line::from(format!(
+                            "{}  {}",
+                            ui.tr("account-enabled"),
+                            if account.enabled {
+                                ui.tr("on")
+                            } else {
+                                ui.tr("off")
+                            }
+                        )),
+                        Line::from(format!("{}      {}", ui.tr("priority"), account.priority)),
+                        Line::from(format!(
+                            "{}  {}",
+                            ui.tr("concurrency-limit"),
+                            if account.concurrency_limit == 0 {
+                                ui.tr("unlimited")
+                            } else {
+                                account.concurrency_limit.to_string()
+                            }
+                        )),
+                        Line::from(format!(
                             "{}        {}",
                             ui.tr("status"),
                             account.status.detail
@@ -1259,6 +1278,16 @@ fn draw_detail(
                                 .map(str::to_owned)
                                 .unwrap_or_else(|| ui.tr("not-circuited"))
                         )),
+                        Line::from("Recent account events:"),
+                        Line::from(
+                            ui.recent_events
+                                .iter()
+                                .filter(|event| event.account_id == Some(account.id))
+                                .take(3)
+                                .map(|event| format!("  {} · {}", event.kind, event.detail))
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
                         Line::from(""),
                         Line::from(ui.tr("privacy-detail-note")),
                     ]
@@ -2764,6 +2793,9 @@ fn status_style(ui: &Ui, theme: super::ThemeColors, kind: &StatusKind) -> (Color
         StatusKind::Exhausted => (theme.error, ui.tr("status-exhausted")),
         StatusKind::Reauth => (theme.warning, ui.tr("status-reauth")),
         StatusKind::AccessDenied => (theme.error, ui.tr("status-denied")),
+        StatusKind::RateLimited => (theme.warning, ui.tr("status-exhausted")),
+        StatusKind::TemporaryFailure => (theme.error, ui.tr("status-unknown")),
+        StatusKind::Disabled => (theme.muted, ui.tr("status-unknown")),
         StatusKind::Invalid => (theme.error, ui.tr("status-invalid")),
         StatusKind::Unknown => (theme.unknown, ui.tr("status-unknown")),
     }
@@ -2912,6 +2944,10 @@ mod tests {
             },
             tenant_id: "local".into(),
             proxy_enabled: true,
+            enabled: true,
+            priority: 100,
+            concurrency_limit: 0,
+            revision: 1,
         };
         let mut ui = Ui::new(
             config,
@@ -3103,6 +3139,10 @@ mod tests {
             status: CheckStatus::default(),
             tenant_id: "local".into(),
             proxy_enabled: true,
+            enabled: true,
+            priority: 100,
+            concurrency_limit: 0,
+            revision: 1,
         };
         let mut ui = Ui::new_with_render_mode(
             config,

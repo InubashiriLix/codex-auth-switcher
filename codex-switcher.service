@@ -2,13 +2,15 @@
 Description=Codex Authentication Proxy
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=notify
 ExecStart=%h/.cargo/bin/codex-switcher --daemon
 ExecReload=/bin/kill -SIGHUP $MAINPID
 Restart=on-failure
-RestartSec=5s
+RestartSec=10s
 
 # 环境变量
 Environment="RUST_LOG=info"

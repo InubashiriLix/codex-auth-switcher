@@ -12,6 +12,7 @@ One local entry point for multiple Codex accounts. Codex Switcher stores authent
 - Switch only at safe request boundaries and preserve unrelated Codex configuration.
 - Keep metadata-only history; prompts, source code, responses, tokens, and authorization headers are never stored.
 - Use the TUI, an attached daemon, or a long-running systemd user service.
+- Run a local Doctor, inspect account fault timelines, and export a sanitized support bundle.
 - Display the application in Chinese, English, Japanese, Spanish, German, Italian, or French.
 
 ## Install
@@ -49,6 +50,24 @@ codex-switcher daemon-status
 codex-switcher daemon-reload
 codex-switcher daemon-stop
 ```
+
+## Reliability tools
+
+```bash
+# Offline by default: checks configuration, snapshots, integration, runtime DB and proxy port.
+codex-switcher doctor
+# Explicitly add a minimal DNS/TLS/upstream reachability check.
+codex-switcher doctor --network --json
+
+# After you complete the official Codex login yourself, update the affected snapshot.
+codex-switcher account update-current ACCOUNT_ID
+codex-switcher account events ACCOUNT_ID --json
+
+# The archive contains only sanitized metadata, configuration and diagnosis.
+codex-switcher support-bundle --output ./codex-switcher-support.tar.gz
+```
+
+The monitor keeps healthy accounts fresh at a high cadence. Failed accounts are retried with a bounded exponential backoff and jitter; real proxy requests update health immediately.
 
 ## Language
 
@@ -97,6 +116,8 @@ mkdir -p ~/.config/systemd/user
 cp codex-switcher.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now codex-switcher.service
+systemctl --user status codex-switcher.service
+journalctl --user -u codex-switcher.service -e
 ```
 
 ## Windows (x86_64)
@@ -112,6 +133,25 @@ The MSI installs the executable, registers a demand-start LocalService daemon, a
 ```
 
 Use `service status`, `service stop`, and `service uninstall` to manage it. The service cannot display desktop notifications; switch events remain available through the TUI and runtime history. The installer is not Authenticode-signed yet, so Windows will show an unknown-publisher warning.
+
+## Device identity convergence
+
+The proxy reuses `codex_home/installation_id` by default and derives a UUID from a stable local-machine seed only when that file is missing or invalid. It consistently rewrites `x-codex-installation-id`, `x-codex-turn-metadata.installation_id`, and the matching `client_metadata` projection. It deliberately preserves `session_id`, `thread_id`, `window_id`, and `prompt_cache_key`, so separate conversations do not collapse into one session. Zstd-compressed requests are decoded, normalized, and recompressed. This is local consistency only; it does not impersonate other users or devices.
+
+```toml
+[proxy.device_identity]
+enabled = true
+# Optional: retain an existing identity while migrating this same machine.
+installation_id = "00000000-0000-0000-0000-000000000000"
+
+[proxy.auth_policy]
+refresh_before_expiry_seconds = 300
+refresh_once_on_401 = true
+cross_account_replay = false
+rate_limit_fallback_seconds = 900
+```
+
+Without an explicit `installation_id`, the configured Codex home and the same machine retain a stable ID automatically. `user_agent` and `originator` always retain the client values; legacy override fields are ignored.
 
 ## Security boundary
 

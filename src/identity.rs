@@ -130,8 +130,23 @@ impl ProcessInspector for SystemProcessInspector {
     }
 }
 
-fn local_device_id() -> String {
+pub(crate) fn local_device_id() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "local-device".into())
+}
+
+/// Best-effort stable seed for deriving a non-reversible proxy installation
+/// identifier. Raw machine identifiers never leave this process.
+pub(crate) fn local_device_seed() -> String {
+    #[cfg(unix)]
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(value) = std::fs::read_to_string(path) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return value.to_owned();
+            }
+        }
+    }
+    local_device_id()
 }

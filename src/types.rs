@@ -22,6 +22,32 @@ pub struct Account {
     /// Accounts are opt-in for proxy routing after upgrading an old index.
     #[serde(default)]
     pub proxy_enabled: bool,
+    /// Administrative enablement is separate from proxy-pool membership.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Lower values are preferred. Accounts in the same priority tier are
+    /// selected by the configured load-balancing strategy.
+    #[serde(default = "default_account_priority")]
+    pub priority: i32,
+    /// Maximum simultaneous upstream requests. New accounts default to one;
+    /// zero remains an explicit unlimited compatibility value.
+    #[serde(default = "default_account_concurrency_limit")]
+    pub concurrency_limit: usize,
+    /// Monotonic account revision used to reject stale daemon snapshots.
+    #[serde(default)]
+    pub revision: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_account_priority() -> i32 {
+    100
+}
+
+fn default_account_concurrency_limit() -> usize {
+    1
 }
 
 fn default_tenant_id() -> String {
@@ -55,6 +81,9 @@ pub enum StatusKind {
     Exhausted,
     Reauth,
     AccessDenied,
+    RateLimited,
+    TemporaryFailure,
+    Disabled,
     Invalid,
     Unknown,
 }

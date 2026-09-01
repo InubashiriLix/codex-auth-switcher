@@ -1,11 +1,16 @@
 use crate::{
-    account::{activate, import_current, import_file, import_value, probe, save_index},
+    account::{
+        activate, import_current, import_file, import_value, probe, save_index, update_from_current,
+    },
     config::{Config, save_config},
+    diagnostics,
     error::*,
     i18n::{translate, translate_with},
     paths::Paths,
+    storage::{MetadataStore, RetentionPolicy},
     types::{Account, AccountIndex},
 };
+use chrono::Utc;
 use futures_util::StreamExt;
 use std::{
     path::Path,
@@ -13,6 +18,31 @@ use std::{
     thread,
     time::Duration,
 };
+
+fn daemon_account_index(
+    paths: &Paths,
+    method: hyper::Method,
+    endpoint: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<Option<AccountIndex>> {
+    if !matches!(
+        crate::daemon::check_daemon_status(paths)?,
+        crate::daemon::DaemonStatus::Running(_)
+    ) {
+        return Ok(None);
+    }
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        crate::daemon::control_request_json(paths, method, endpoint, body).await?;
+        let response =
+            crate::daemon::control_request(paths, hyper::Method::GET, "/v1/accounts").await?;
+        let accounts = response
+            .get("accounts")
+            .cloned()
+            .ok_or_else(|| AppError::Message("控制面未返回账户索引".into()))?;
+        Ok(Some(serde_json::from_value(accounts)?))
+    })
+}
 
 /// Persist the account index and, when a daemon is running, make its in-memory
 /// index observe the same revision before the next snapshot is accepted.
@@ -41,6 +71,16 @@ pub fn import_current_auth(
     index: &mut AccountIndex,
     paths: &Paths,
 ) -> Result<String> {
+    if let Some(updated) =
+        daemon_account_index(paths, hyper::Method::POST, "/v1/accounts/import", None)?
+    {
+        *index = updated;
+        return Ok(translate(
+            config.language.resolve(),
+            "notice-imported-current",
+            None,
+        ));
+    }
     let original = index.clone();
     import_current(config, index)?;
     if let Err(error) = persist_index(paths, index) {
@@ -52,6 +92,72 @@ pub fn import_current_auth(
         "notice-imported-current",
         None,
     ))
+}
+
+/// Update a selected profile after the user has completed the official Codex
+/// login flow outside this application.
+pub fn update_account_from_current(
+    config: &Config,
+    index: &mut AccountIndex,
+    paths: &Paths,
+    account_idx: usize,
+) -> Result<String> {
+    let id = index
+        .accounts
+        .get(account_idx)
+        .map(|account| account.id)
+        .ok_or_else(|| AppError::Message("找不到账户".into()))?;
+    if let Some(updated) = daemon_account_index(
+        paths,
+        hyper::Method::POST,
+        &format!("/v1/accounts/{id}/update-current"),
+        None,
+    )? {
+        *index = updated;
+        return Ok("已用当前官方登录更新账户快照".into());
+    }
+    let original = index.clone();
+    if let Err(error) =
+        update_from_current(config, index, id).and_then(|_| persist_index(paths, index))
+    {
+        *index = original;
+        return Err(error);
+    }
+    Ok("已用当前官方登录更新账户快照".into())
+}
+
+pub fn run_doctor(config: &Config, index: &AccountIndex, paths: &Paths) -> String {
+    let report = diagnostics::doctor(config, paths, index, false);
+    let failures = report
+        .checks
+        .iter()
+        .filter(|check| check.status == diagnostics::DoctorStatus::Fail)
+        .count();
+    if failures == 0 {
+        "Doctor：本地检查通过（网络检查需显式使用 CLI --network）".into()
+    } else {
+        format!("Doctor：发现 {failures} 项问题；运行 `codex-switcher doctor` 查看详情")
+    }
+}
+
+pub fn export_support_bundle(
+    config: &Config,
+    index: &AccountIndex,
+    paths: &Paths,
+) -> Result<String> {
+    let filename = format!("support-{}.tar.gz", Utc::now().format("%Y%m%d-%H%M%S"));
+    let output = paths.config_dir.join(filename);
+    let store = MetadataStore::open(
+        &paths.database_file,
+        RetentionPolicy {
+            days: config.retention.days,
+            max_requests: config.retention.max_requests,
+            max_events: config.retention.max_events,
+        },
+    )
+    .ok();
+    diagnostics::write_support_bundle(&output, config, paths, index, store.as_ref(), false)?;
+    Ok(format!("已导出脱敏支持包：{}", output.display()))
 }
 
 /// 从文件路径导入
@@ -68,6 +174,20 @@ pub fn import_from_path(
             "error-file-missing",
             [("path", path)],
         )));
+    }
+
+    if let Some(updated) = daemon_account_index(
+        paths,
+        hyper::Method::POST,
+        "/v1/accounts/import",
+        Some(&serde_json::json!({"path":path})),
+    )? {
+        *index = updated;
+        return Ok(translate_with(
+            config.language.resolve(),
+            "notice-imported-path",
+            [("path", path)],
+        ));
     }
 
     let original = index.clone();
@@ -98,6 +218,21 @@ pub fn import_from_json(
             [("error", e.to_string())],
         ))
     })?;
+
+    let import_body = serde_json::json!({"value":value.clone(),"name":name.clone()});
+    if let Some(updated) = daemon_account_index(
+        paths,
+        hyper::Method::POST,
+        "/v1/accounts/import",
+        Some(&import_body),
+    )? {
+        *index = updated;
+        return Ok(translate(
+            config.language.resolve(),
+            "notice-imported-json",
+            None,
+        ));
+    }
 
     let original = index.clone();
     import_value(config, index, value, "手动输入".into(), name)?;
@@ -130,10 +265,36 @@ pub fn rename_account(
     account_idx: usize,
     new_name: String,
 ) -> Result<String> {
+    let (id, old_name) = index
+        .accounts
+        .get(account_idx)
+        .map(|account| (account.id, account.label.clone()))
+        .ok_or_else(|| {
+            AppError::Message(translate(
+                config.language.resolve(),
+                "error-account-missing",
+                None,
+            ))
+        })?;
+    let patch = serde_json::json!({"label":new_name.clone()});
+    if let Some(updated) = daemon_account_index(
+        paths,
+        hyper::Method::PATCH,
+        &format!("/v1/accounts/{id}"),
+        Some(&patch),
+    )? {
+        *index = updated;
+        return Ok(translate_with(
+            config.language.resolve(),
+            "notice-renamed",
+            [("from", old_name), ("to", new_name)],
+        ));
+    }
     let original = index.clone();
     if let Some(account) = index.accounts.get_mut(account_idx) {
         let old_name = account.label.clone();
         account.label = new_name.clone();
+        account.revision = account.revision.saturating_add(1);
         if let Err(error) = persist_index(paths, index) {
             *index = original;
             return Err(error);
@@ -161,6 +322,19 @@ pub fn delete_account(
 ) -> Result<String> {
     if account_idx < index.accounts.len() {
         let account = index.accounts[account_idx].clone();
+        if let Some(updated) = daemon_account_index(
+            paths,
+            hyper::Method::DELETE,
+            &format!("/v1/accounts/{}", account.id),
+            None,
+        )? {
+            *index = updated;
+            return Ok(translate_with(
+                config.language.resolve(),
+                "notice-deleted",
+                [("account", account.label)],
+            ));
+        }
         // If this is the active route, move it to another pool member before
         // removing the profile so in-flight requests never retain a dead ID.
         if let Ok(crate::daemon::DaemonStatus::Running(_)) =
@@ -220,10 +394,31 @@ pub fn probe_account(
     paths: &Paths,
     account_idx: usize,
 ) -> Result<String> {
+    let id = index
+        .accounts
+        .get(account_idx)
+        .map(|account| account.id)
+        .ok_or_else(|| {
+            AppError::Message(translate(
+                config.language.resolve(),
+                "error-account-missing",
+                None,
+            ))
+        })?;
+    if let Some(updated) = daemon_account_index(
+        paths,
+        hyper::Method::POST,
+        &format!("/v1/accounts/{id}/probe"),
+        None,
+    )? {
+        *index = updated;
+        return Ok(translate(config.language.resolve(), "notice-checked", None));
+    }
     let original = index.clone();
     if let Some(account) = index.accounts.get_mut(account_idx) {
         let label = account.label.clone();
         probe(config, account);
+        account.revision = account.revision.saturating_add(1);
         if let Err(error) = persist_index(paths, index) {
             *index = original;
             return Err(error);
@@ -248,10 +443,22 @@ pub fn probe_all_accounts(
     index: &mut AccountIndex,
     paths: &Paths,
 ) -> Result<String> {
+    if let Some(updated) =
+        daemon_account_index(paths, hyper::Method::POST, "/v1/accounts/probe-all", None)?
+    {
+        let count = updated.accounts.len();
+        *index = updated;
+        return Ok(translate_with(
+            config.language.resolve(),
+            "notice-checked-all",
+            [("count", count)],
+        ));
+    }
     let original = index.clone();
     let count = index.accounts.len();
     for account in &mut index.accounts {
         probe(config, account);
+        account.revision = account.revision.saturating_add(1);
     }
     if let Err(error) = persist_index(paths, index) {
         *index = original;
@@ -324,6 +531,8 @@ pub fn poll_probe(paths: &Paths, ui: &mut Ui) -> Result<()> {
                         // Merge only health fields and retain the current UI
                         // identity/pool membership.
                         ui.index.accounts[pos].status = account.status;
+                        ui.index.accounts[pos].revision =
+                            ui.index.accounts[pos].revision.saturating_add(1);
                     }
                     checking.completed += 1;
                 }

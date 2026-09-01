@@ -1,5 +1,6 @@
 use crate::{
     config::{ProxyConfig, RecommendStrategy},
+    storage::MetadataStore,
     types::{Account, AccountIndex, StatusKind},
 };
 use chrono::{DateTime, Duration, Utc};
@@ -16,8 +17,13 @@ use uuid::Uuid;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CircuitReason {
     Unauthorized,
+    InvalidCredential,
+    OrganizationMismatch,
+    MembershipRemoved,
+    IpAllowlist,
     Forbidden,
     RateLimited,
+    QuotaBlocked,
     Reauth,
 }
 
@@ -26,6 +32,8 @@ struct Circuit {
     reason: CircuitReason,
     until: Option<DateTime<Utc>>,
 }
+
+const SESSION_BINDING_TTL_HOURS: i64 = 24;
 
 #[derive(Clone, Debug)]
 pub struct RouteDecision {
@@ -49,6 +57,8 @@ pub struct Router {
     round_robin_cursor: Arc<Mutex<usize>>,
     paused: Arc<AtomicBool>,
     preferred: Arc<RwLock<Option<Uuid>>>,
+    active: Arc<Mutex<HashMap<Uuid, usize>>>,
+    store: Arc<RwLock<Option<Arc<MetadataStore>>>>,
 }
 
 impl Router {
@@ -60,7 +70,35 @@ impl Router {
             round_robin_cursor: Arc::new(Mutex::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
             preferred: Arc::new(RwLock::new(None)),
+            active: Arc::new(Mutex::new(HashMap::new())),
+            store: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub fn attach_store(&self, store: Arc<MetadataStore>) {
+        if let Ok(bindings) = store.load_bindings() {
+            let mut current = self.bindings.lock();
+            for binding in bindings {
+                current.insert(binding.sticky_key, binding.account_id);
+            }
+        }
+        if let Ok(circuits) = store.load_circuits() {
+            let mut current = self.circuits.lock();
+            for circuit in circuits {
+                if circuit.until.is_none_or(|until| until > Utc::now())
+                    && let Some(reason) = circuit_reason_from_name(&circuit.reason)
+                {
+                    current.insert(
+                        circuit.account_id,
+                        Circuit {
+                            reason,
+                            until: circuit.until,
+                        },
+                    );
+                }
+            }
+        }
+        *self.store.write() = Some(store);
     }
 
     pub fn pause(&self) {
@@ -111,11 +149,9 @@ impl Router {
                     sticky: true,
                 });
             }
-            if !config.auto_switch {
-                let mut error = self.unavailable_error(accounts);
-                error.reason = "当前粘性账户不可用，自动切换尚未启用".into();
-                return Err(error);
-            }
+            let mut error = self.unavailable_error(accounts);
+            error.reason = "当前粘性账户不可用；为保护会话，不会迁移到其他账户".into();
+            return Err(error);
         }
 
         let mut eligible: Vec<&Account> = accounts
@@ -126,14 +162,14 @@ impl Router {
         if eligible.is_empty() {
             return Err(self.unavailable_error(accounts));
         }
-        eligible.sort_by_key(|account| account.id);
+        eligible.sort_by_key(|account| (account.priority, account.id));
+        let preferred_priority = eligible[0].priority;
+        eligible.retain(|account| account.priority == preferred_priority);
 
         if let Some(preferred) = *self.preferred.read()
             && let Some(account) = eligible.iter().find(|account| account.id == preferred)
         {
-            self.bindings
-                .lock()
-                .insert(sticky_key.to_owned(), account.id);
+            self.bind(sticky_key, account.id);
             return Ok(RouteDecision {
                 account_id: account.id,
                 reason: "用户手动选择".into(),
@@ -157,9 +193,7 @@ impl Router {
         }
         .expect("eligible list is non-empty");
 
-        self.bindings
-            .lock()
-            .insert(sticky_key.to_owned(), selected.id);
+        self.bind(sticky_key, selected.id);
         Ok(RouteDecision {
             account_id: selected.id,
             reason: format!("{:?} 策略", config.strategy),
@@ -169,6 +203,42 @@ impl Router {
 
     pub fn unbind(&self, sticky_key: &str) {
         self.bindings.lock().remove(sticky_key);
+        if let Some(store) = self.store.read().as_ref() {
+            let _ = store.delete_binding(sticky_key);
+        }
+    }
+
+    fn bind(&self, sticky_key: &str, account_id: Uuid) {
+        self.bindings
+            .lock()
+            .insert(sticky_key.to_owned(), account_id);
+        if sticky_key.starts_with("session:")
+            && let Some(store) = self.store.read().as_ref()
+        {
+            let _ = store.save_binding(
+                sticky_key,
+                account_id,
+                Duration::hours(SESSION_BINDING_TTL_HOURS),
+            );
+        }
+    }
+
+    pub fn acquire(&self, account_id: Uuid) {
+        *self.active.lock().entry(account_id).or_insert(0) += 1;
+    }
+
+    pub fn release(&self, account_id: Uuid) {
+        let mut active = self.active.lock();
+        if let Some(count) = active.get_mut(&account_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.remove(&account_id);
+            }
+        }
+    }
+
+    pub fn active_count(&self, account_id: Uuid) -> usize {
+        self.active.lock().get(&account_id).copied().unwrap_or(0)
     }
 
     pub fn binding_for(&self, sticky_key: &str) -> Option<Uuid> {
@@ -189,13 +259,20 @@ impl Router {
         reason: CircuitReason,
         until: Option<DateTime<Utc>>,
     ) {
+        let reason_name = circuit_reason_name(&reason);
         self.circuits
             .lock()
             .insert(account_id, Circuit { reason, until });
+        if let Some(store) = self.store.read().as_ref() {
+            let _ = store.save_circuit(account_id, reason_name, until);
+        }
     }
 
     pub fn close_circuit(&self, account_id: Uuid) {
         self.circuits.lock().remove(&account_id);
+        if let Some(store) = self.store.read().as_ref() {
+            let _ = store.clear_circuit(account_id);
+        }
     }
 
     pub fn circuit_reason(&self, account_id: Uuid) -> Option<CircuitReason> {
@@ -207,13 +284,19 @@ impl Router {
     }
 
     fn eligible(&self, account: &Account, existing_binding: bool, threshold: f64) -> bool {
-        if !account.proxy_enabled
+        if !account.enabled
+            || !account.proxy_enabled
             || account.tenant_id != "local"
             || account.status.kind != StatusKind::Live
         {
             return false;
         }
         if self.circuits.lock().contains_key(&account.id) {
+            return false;
+        }
+        if account.concurrency_limit > 0
+            && self.active_count(account.id) >= account.concurrency_limit
+        {
             return false;
         }
         let fresh = account
@@ -233,9 +316,19 @@ impl Router {
 
     fn expire_circuits(&self) {
         let now = Utc::now();
-        self.circuits
-            .lock()
-            .retain(|_, circuit| circuit.until.is_none_or(|until| until > now));
+        let mut expired = Vec::new();
+        self.circuits.lock().retain(|account_id, circuit| {
+            let keep = circuit.until.is_none_or(|until| until > now);
+            if !keep {
+                expired.push(*account_id);
+            }
+            keep
+        });
+        if let Some(store) = self.store.read().as_ref() {
+            for account_id in expired {
+                let _ = store.clear_circuit(account_id);
+            }
+        }
     }
 
     fn unavailable_error(&self, accounts: &AccountIndex) -> RouteError {
@@ -269,6 +362,35 @@ impl Router {
             retry_after_seconds,
             earliest_recovery: earliest,
         }
+    }
+}
+
+fn circuit_reason_name(reason: &CircuitReason) -> &'static str {
+    match reason {
+        CircuitReason::Unauthorized => "unauthorized",
+        CircuitReason::InvalidCredential => "invalid_credential",
+        CircuitReason::OrganizationMismatch => "organization_mismatch",
+        CircuitReason::MembershipRemoved => "membership_removed",
+        CircuitReason::IpAllowlist => "ip_allowlist_error",
+        CircuitReason::Forbidden => "forbidden",
+        CircuitReason::RateLimited => "rate_limited",
+        CircuitReason::QuotaBlocked => "quota_blocked",
+        CircuitReason::Reauth => "reauth_required",
+    }
+}
+
+fn circuit_reason_from_name(value: &str) -> Option<CircuitReason> {
+    match value {
+        "unauthorized" => Some(CircuitReason::Unauthorized),
+        "invalid_credential" => Some(CircuitReason::InvalidCredential),
+        "organization_mismatch" => Some(CircuitReason::OrganizationMismatch),
+        "membership_removed" => Some(CircuitReason::MembershipRemoved),
+        "ip_allowlist_error" => Some(CircuitReason::IpAllowlist),
+        "forbidden" => Some(CircuitReason::Forbidden),
+        "rate_limited" => Some(CircuitReason::RateLimited),
+        "quota_blocked" => Some(CircuitReason::QuotaBlocked),
+        "reauth_required" => Some(CircuitReason::Reauth),
+        _ => None,
     }
 }
 
@@ -328,6 +450,10 @@ mod tests {
             },
             tenant_id: "local".into(),
             proxy_enabled: enabled,
+            enabled: true,
+            priority: 100,
+            concurrency_limit: 0,
+            revision: 1,
         }
     }
 
@@ -355,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn circuit_breaker_removes_sticky_binding() {
+    fn circuit_breaker_never_migrates_an_existing_binding() {
         let config = ProxyConfig {
             auto_switch: true,
             ..ProxyConfig::default()
@@ -366,6 +492,42 @@ mod tests {
         };
         let first = router.route(&index, "p1").unwrap().account_id;
         router.open_circuit(first, CircuitReason::Forbidden, None);
-        assert_ne!(router.route(&index, "p1").unwrap().account_id, first);
+        let error = router.route(&index, "p1").unwrap_err();
+        assert!(error.reason.contains("不会迁移"));
+        assert_ne!(
+            router.route(&index, "new-session").unwrap().account_id,
+            first
+        );
+    }
+
+    #[test]
+    fn priority_tier_and_concurrency_limit_bound_routing() {
+        let router = Router::new(ProxyConfig::default());
+        let mut preferred = account(1, 80.0, true);
+        preferred.priority = 1;
+        let mut lower_priority = account(2, 1.0, true);
+        lower_priority.priority = 100;
+        let index = AccountIndex {
+            accounts: vec![preferred, lower_priority],
+        };
+        assert_eq!(
+            router.route(&index, "priority").unwrap().account_id,
+            Uuid::from_u128(1)
+        );
+
+        let mut first = account(3, 10.0, true);
+        first.concurrency_limit = 1;
+        let second = account(4, 20.0, true);
+        let index = AccountIndex {
+            accounts: vec![first, second],
+        };
+        let selected = router.route(&index, "one").unwrap().account_id;
+        assert_eq!(selected, Uuid::from_u128(3));
+        router.acquire(selected);
+        assert_eq!(
+            router.route(&index, "two").unwrap().account_id,
+            Uuid::from_u128(4)
+        );
+        router.release(selected);
     }
 }
